@@ -166,6 +166,7 @@ pip install pipx && pipx ensurepath && pipx run mini-swe-agent
 ```bash
 pip install mini-swe-agent
 mini  # run the CLI
+mini-gui  # run the browser GUI with streaming responses
 ```
 
 **Option 3:** Install from source (developer setup)
@@ -180,6 +181,7 @@ Read more in our [documentation](https://mini-swe-agent.com/latest/):
 
 * [Quick start guide](https://mini-swe-agent.com/latest/quickstart/)
 * [Using the `mini` CLI](https://mini-swe-agent.com/latest/usage/mini/)
+* [Using the web GUI](https://mini-swe-agent.com/latest/usage/gui/)
 * [Global configuration](https://mini-swe-agent.com/latest/advanced/global_configuration/)
 * [Yaml configuration files](https://mini-swe-agent.com/latest/advanced/yaml_configuration/)
 * [Power up with the cookbook](https://mini-swe-agent.com/latest/advanced/cookbook/)

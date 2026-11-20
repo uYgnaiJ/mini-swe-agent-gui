@@ -18,6 +18,7 @@ from minisweagent.models.utils.actions_toolcall import (
 )
 from minisweagent.models.utils.anthropic_utils import _reorder_anthropic_thinking_blocks
 from minisweagent.models.utils.cache_control import set_cache_control
+from minisweagent.models.utils.content_string import get_content_string
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
 from minisweagent.models.utils.retry import retry
 
@@ -47,6 +48,9 @@ class LitellmModelConfig(BaseModel):
 
 
 class LitellmModel:
+    supports_streaming = True
+    """Whether ``stream_query`` can emit token deltas as they arrive."""
+
     abort_exceptions: list[type[Exception]] = [
         litellm.exceptions.UnsupportedParamsError,
         litellm.exceptions.NotFoundError,
@@ -78,10 +82,107 @@ class LitellmModel:
         prepared = _reorder_anthropic_thinking_blocks(prepared)
         return set_cache_control(prepared, mode=self.config.set_cache_control)
 
+    def stream_query(self, messages: list[dict[str, str]], callback: Callable[[dict[str, Any]], None]) -> dict:
+        """Like ``query``, but emit incremental response events through ``callback``.
+
+        Events have the shape ``{"type": "assistant_delta", "text": "..."}``.
+        A final, fully assembled model response is still parsed and returned in
+        exactly the same format as :meth:`query`.
+        """
+        if not self.supports_streaming:
+            # Some providers (e.g. the Responses API) use a different streaming
+            # event format. Fall back to a single final-message event rather
+            # than failing the GUI run.
+            message = self.query(messages)
+            callback({"type": "assistant_start"})
+            text = get_content_string(message)
+            if text:
+                callback({"type": "assistant_delta", "text": text})
+            callback({"type": "assistant_end"})
+            return message
+        return self.query(messages, stream_callback=callback)
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("text"):
+                    parts.append(str(item["text"]))
+            return "".join(parts)
+        return ""
+
+    def _emit_stream_chunk(self, chunk: Any, callback: Callable[[dict[str, Any]], None]) -> None:
+        # LiteLLM emits pydantic objects for most providers, but some custom
+        # providers/tests use plain dictionaries for streaming chunks.
+        choices = getattr(chunk, "choices", None)
+        if choices is None and isinstance(chunk, dict):
+            choices = chunk.get("choices")
+        choices = choices or []
+        if not choices:
+            return
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None and isinstance(choice, dict):
+            delta = choice.get("delta")
+        if delta is None:
+            return
+
+        def field(obj: Any, key: str) -> Any:
+            return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+        text = self._content_to_text(field(delta, "content"))
+        if text:
+            callback({"type": "assistant_delta", "text": text})
+        reasoning = field(delta, "reasoning_content") or field(delta, "reasoning")
+        reasoning_text = self._content_to_text(reasoning)
+        if reasoning_text:
+            callback({"type": "reasoning_delta", "text": reasoning_text})
+        for tool_call in field(delta, "tool_calls") or []:
+            function = field(tool_call, "function")
+            arguments = field(function, "arguments") if function is not None else None
+            name = field(function, "name") if function is not None else None
+            if arguments:
+                callback({"type": "tool_call_delta", "text": arguments, "name": name})
+
+    def _query_streaming(
+        self,
+        messages: list[dict[str, str]],
+        callback: Callable[[dict[str, Any]], None],
+        **kwargs,
+    ) -> Any:
+        callback({"type": "assistant_start"})
+        chunks = []
+        try:
+            # ``_query`` forwards these kwargs to the underlying provider. The
+            # stream option keeps all provider-specific request construction in
+            # one place (and works for the text-based subclass too).
+            stream_options = {"include_usage": True, **(kwargs.pop("stream_options", None) or {})}
+            stream = self._query(messages, stream=True, stream_options=stream_options, **kwargs)
+            for chunk in stream:
+                chunks.append(chunk)
+                self._emit_stream_chunk(chunk, callback)
+        finally:
+            callback({"type": "assistant_end"})
+        response = litellm.stream_chunk_builder(chunks, messages=messages)
+        if response is None:
+            msg = "LiteLLM returned an empty response stream"
+            raise RuntimeError(msg)
+        return response
+
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        stream_callback = kwargs.pop("stream_callback", None)
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
-                response = self._query(self._prepare_messages_for_api(messages), **kwargs)
+                prepared_messages = self._prepare_messages_for_api(messages)
+                if stream_callback is not None and self.supports_streaming:
+                    response = self._query_streaming(prepared_messages, stream_callback, **kwargs)
+                else:
+                    response = self._query(prepared_messages, **kwargs)
         cost_output = self._calculate_cost(response)
         GLOBAL_MODEL_STATS.add(cost_output["cost"])
         # Note: all model.query() implementations must persist the response and cost on FormatError.

@@ -6,13 +6,16 @@ import json
 import logging
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.models.utils.content_string import get_content_string
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -48,6 +51,20 @@ class DefaultAgent:
         self.n_calls = 0
         self.n_consecutive_format_errors = 0
         self._start_time = time.time()
+        self.event_callback: Callable[[dict[str, Any]], None] | None = None
+
+    def set_event_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
+        """Register a callback for live run events (used by the GUI).
+
+        The callback receives JSON-serializable dictionaries such as
+        ``{"type": "assistant_delta", "text": "..."}``. It is safe to call this
+        from a background thread.
+        """
+        self.event_callback = callback
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        if self.event_callback is not None:
+            self.event_callback(event)
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -89,6 +106,14 @@ class DefaultAgent:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        self._emit(
+            {
+                "type": "run_start",
+                "task": task,
+                "step_limit": self.config.step_limit,
+                "cost_limit": self.config.cost_limit,
+            }
+        )
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
@@ -101,6 +126,13 @@ class DefaultAgent:
                 # The call was billed before parsing failed, so query() never got to charge it.
                 self.cost += e.messages[0].get("extra", {}).get("cost", 0.0)
                 self.n_consecutive_format_errors += 1
+                self._emit(
+                    {
+                        "type": "format_error",
+                        "message": get_content_string(e.messages[0]) or str(e),
+                        "consecutive_errors": self.n_consecutive_format_errors,
+                    }
+                )
                 if 0 < self.config.max_consecutive_format_errors <= self.n_consecutive_format_errors:
                     self.add_messages(
                         *e.messages,
@@ -116,12 +148,23 @@ class DefaultAgent:
                 self.add_messages(*e.messages)
             except Exception as e:
                 self.handle_uncaught_exception(e)
+                self._emit({"type": "error", "message": str(e), "traceback": traceback.format_exc()})
                 raise
             finally:
                 self.save(self.config.output_path)
             if self.messages[-1].get("role") == "exit":
                 break
-        return self.messages[-1].get("extra", {})
+        result = self.messages[-1].get("extra", {})
+        self._emit(
+            {
+                "type": "done",
+                "exit_status": result.get("exit_status", ""),
+                "submission": result.get("submission", ""),
+                "cost": self.cost,
+                "n_calls": self.n_calls,
+            }
+        )
+        return result
 
     def step(self) -> list[dict]:
         """Query the LM, execute actions."""
@@ -146,15 +189,59 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        self._emit({"type": "step_start", "step": self.n_calls})
+        if self.event_callback is not None and hasattr(self.model, "stream_query"):
+
+            def forward_stream_event(event: dict[str, Any]) -> None:
+                event.setdefault("step", self.n_calls)
+                self._emit(event)
+
+            message = self.model.stream_query(self.messages, forward_stream_event)
+        else:
+            message = self.model.query(self.messages)
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
+        self._emit(
+            {
+                "type": "assistant_message",
+                "content": get_content_string(message),
+                "actions": message.get("extra", {}).get("actions", []),
+                "cost": message.get("extra", {}).get("cost", 0.0),
+                "step": self.n_calls,
+            }
+        )
         return message
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
-        return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+        outputs = []
+        for action in message.get("extra", {}).get("actions", []):
+            command = action.get("command", "")
+            self._emit({"type": "action_start", "command": command, "tool_call_id": action.get("tool_call_id")})
+            output = self.env.execute(action)
+            outputs.append(output)
+            self._emit(
+                {
+                    "type": "action_output",
+                    "command": command,
+                    "tool_call_id": action.get("tool_call_id"),
+                    "output": output.get("output", ""),
+                    "returncode": output.get("returncode"),
+                    "exception_info": output.get("exception_info"),
+                }
+            )
+        messages = self.add_messages(
+            *self.model.format_observation_messages(message, outputs, self.get_template_vars())
+        )
+        for observation in messages:
+            self._emit(
+                {
+                    "type": "observation",
+                    "content": get_content_string(observation),
+                    "returncode": observation.get("extra", {}).get("returncode"),
+                }
+            )
+        return messages
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""

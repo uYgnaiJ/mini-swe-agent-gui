@@ -129,13 +129,34 @@ class InteractiveAgent(DefaultAgent):
         try:
             self._ask_confirmation_or_interrupt(commands)
             for action in actions:
-                outputs.append(self.env.execute(action))
+                command = action.get("command", "")
+                self._emit({"type": "action_start", "command": command, "tool_call_id": action.get("tool_call_id")})
+                output = self.env.execute(action)
+                outputs.append(output)
+                self._emit(
+                    {
+                        "type": "action_output",
+                        "command": command,
+                        "tool_call_id": action.get("tool_call_id"),
+                        "output": output.get("output", ""),
+                        "returncode": output.get("returncode"),
+                        "exception_info": output.get("exception_info"),
+                    }
+                )
         except Submitted as e:
             self._check_for_new_task_or_submit(e)
         finally:
             result = self.add_messages(
                 *self.model.format_observation_messages(message, outputs, self.get_template_vars())
             )
+            for observation in result:
+                self._emit(
+                    {
+                        "type": "observation",
+                        "content": get_content_string(observation),
+                        "returncode": observation.get("extra", {}).get("returncode"),
+                    }
+                )
         return result
 
     def _add_observation_messages(self, message: dict, outputs: list[dict]) -> list[dict]:

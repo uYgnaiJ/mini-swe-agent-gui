@@ -23,6 +23,8 @@ class LitellmResponseModelConfig(LitellmModelConfig):
 
 
 class LitellmResponseModel(LitellmModel):
+    supports_streaming = False
+
     def __init__(self, *, config_class: Callable = LitellmResponseModelConfig, **kwargs):
         super().__init__(config_class=config_class, **kwargs)
 
