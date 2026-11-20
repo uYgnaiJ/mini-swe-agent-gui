@@ -58,6 +58,7 @@ def main(
     agent_class: str | None = typer.Option(None, "--agent-class", help="Agent class to use (e.g., 'interactive' or 'minisweagent.agents.interactive.InteractiveAgent')", rich_help_panel="Advanced"),
     environment_class: str | None = typer.Option(None, "--environment-class", help="Environment class to use (e.g., 'local' or 'minisweagent.environments.local.LocalEnvironment')", rich_help_panel="Advanced"),
     task: str | None = typer.Option(None, "-t", "--task", help="Task/problem statement", show_default=False),
+    image: list[str] | None = typer.Option(None, "-i", "--image", help="Attach an image (path, URL, or data URL). Repeat for multiple images."),
     yolo: bool = typer.Option(False, "-y", "--yolo", help="Run without confirmation"),
     cost_limit: float | None = typer.Option(None, "-l", "--cost-limit", help="Cost limit. Set to 0 to disable."),
     config_spec: list[str] = typer.Option([str(DEFAULT_CONFIG_FILE)], "-c", "--config", help=_CONFIG_SPEC_HELP_TEXT),
@@ -70,9 +71,13 @@ def main(
     # Build the config from the command line arguments
     console.print(f"Building agent config from specs: [bold green]{config_spec}[/bold green]")
     configs = [get_config_from_spec(spec) for spec in config_spec]
+    # When ``main`` is called directly from Python, Typer's ``OptionInfo``
+    # default can be passed through instead of an option value.
+    cli_images = list(image) if isinstance(image, (list, tuple)) else []
     configs.append({
         "run": {
             "task": task or UNSET,
+            "images": cli_images or UNSET,
         },
         "agent": {
             "agent_class": agent_class or UNSET,
@@ -99,7 +104,11 @@ def main(
     model = get_model(config=config.get("model", {}))
     env = get_environment(config.get("environment", {}), default_type="local")
     agent = get_agent(model, env, config.get("agent", {}), default_type="interactive")
-    agent.run(run_task)
+    run_images = config.get("run", {}).get("images") or []
+    if isinstance(run_images, (list, tuple)) and run_images:
+        agent.run(run_task, images=list(run_images))
+    else:
+        agent.run(run_task)
     if (output_path := config.get("agent", {}).get("output_path")):
         console.print(f"Saved trajectory to [bold green]'{output_path}'[/bold green]")
     return agent

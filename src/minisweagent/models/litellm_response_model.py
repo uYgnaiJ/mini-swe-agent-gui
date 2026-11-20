@@ -14,6 +14,7 @@ from minisweagent.models.utils.actions_toolcall_response import (
     parse_toolcall_actions_response,
 )
 from minisweagent.models.utils.retry import retry
+from minisweagent.utils.images import to_responses_api_content
 
 logger = logging.getLogger("litellm_response_model")
 
@@ -36,7 +37,10 @@ class LitellmResponseModel(LitellmModel):
                 for item in msg.get("output", []):
                     result.append({k: v for k, v in item.items() if k != "extra"})
             else:
-                result.append({k: v for k, v in msg.items() if k != "extra"})
+                item = {k: v for k, v in msg.items() if k != "extra"}
+                if "content" in item:
+                    item["content"] = to_responses_api_content(item["content"])
+                result.append(item)
         return result
 
     def _query(self, messages: list[dict[str, str]], **kwargs):
@@ -80,8 +84,9 @@ class LitellmResponseModel(LitellmModel):
         return message
 
     def _parse_actions(self, response) -> list[dict]:
+        output = response.output if hasattr(response, "output") else response.get("output", [])
         return parse_toolcall_actions_response(
-            getattr(response, "output", []),
+            output,
             format_error_template=self.config.format_error_template,
             template_kwargs={"finish_reason": finish_reason_from_responses_api(response)},
         )

@@ -6,6 +6,7 @@ import time
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.direct_response import is_direct_response
 
 # OpenRouter/OpenAI Responses API uses a flat structure (no nested "function" key)
 BASH_TOOL_RESPONSE_API = {
@@ -55,6 +56,23 @@ def finish_reason_from_responses_api(response) -> str | None:
     return "length" if _get(_get(response, "incomplete_details"), "reason") == "max_output_tokens" else status
 
 
+def _text_from_response_output(output: list | None) -> str:
+    """Extract assistant text from a Responses API output list."""
+    texts = []
+    for item in output or []:
+        if _get(item, "type") != "message":
+            continue
+        content = _get(item, "content") or []
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        for part in content:
+            text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if isinstance(text, str):
+                texts.append(text)
+    return "\n".join(texts)
+
+
 def parse_toolcall_actions_response(
     output: list, *, format_error_template: str, template_kwargs: dict | None = None
 ) -> list[dict]:
@@ -69,15 +87,17 @@ def parse_toolcall_actions_response(
     """
     template_kwargs = template_kwargs or {}
     tool_calls = []
-    for item in output:
+    for item in output or []:
         item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
         if item_type == "function_call":
             tool_calls.append(
                 item.model_dump() if hasattr(item, "model_dump") else dict(item) if not isinstance(item, dict) else item
             )
     if not tool_calls:
+        if is_direct_response(_text_from_response_output(output), template_kwargs.get("finish_reason")):
+            return []
         error_text = Template(format_error_template, undefined=StrictUndefined).render(
-            error="No tool calls found in the response. Every response MUST include at least one tool call.",
+            error="No tool calls found in the response. If you intended to use a tool, include at least one tool call; otherwise provide a complete direct answer.",
             actions=[],
             has_tool_calls=False,
             **template_kwargs,

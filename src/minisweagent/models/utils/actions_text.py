@@ -9,6 +9,7 @@ import time
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.direct_response import is_direct_response
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
 
 
@@ -22,6 +23,8 @@ def parse_regex_actions(
     up here as zero parsed actions -- instead of a generic format error).
     """
     actions = [a.strip() for a in re.findall(action_regex, content, re.DOTALL)]
+    if not actions and is_direct_response(content, (template_kwargs or {}).get("finish_reason")):
+        return []
     if len(actions) != 1:
         error_msg = f"Expected exactly 1 action, found {len(actions)}."
         raise FormatError(

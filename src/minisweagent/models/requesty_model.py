@@ -133,12 +133,13 @@ class RequestyModel:
 
     def _parse_actions(self, response: dict) -> list[dict]:
         """Parse tool calls from the response. Raises FormatError if unknown tool."""
-        tool_calls = response["choices"][0]["message"].get("tool_calls") or []
-        tool_calls = [_DictToObj(tc) for tc in tool_calls]
+        message = response["choices"][0]["message"]
+        tool_calls = [_DictToObj(tc) for tc in (message.get("tool_calls") or [])]
         return parse_toolcall_actions(
             tool_calls,
             format_error_template=self.config.format_error_template,
             template_kwargs={"finish_reason": response["choices"][0].get("finish_reason")},
+            content=message.get("content"),
         )
 
     def format_message(self, **kwargs) -> dict:

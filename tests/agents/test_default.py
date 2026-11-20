@@ -1,4 +1,6 @@
+import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -440,24 +442,43 @@ def test_wall_time_limit_template_vars(model_factory):
     assert tvars["wall_time_limit_seconds"] == 3600
 
 
-def test_empty_actions_handling(model_factory):
-    """Test agent handles empty actions (continues without error)."""
+def test_direct_answer_without_tool_call_finishes(model_factory):
+    """A complete answer with no tool call should finish immediately."""
     factory, config = model_factory
     agent = DefaultAgent(
-        model=factory(
-            [
-                ("No actions here", []),  # Empty actions list
-                ("Now with action", [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho 'done'"}]),
-            ]
-        ),
+        model=factory([("The answer is 4.", [])]),
         env=LocalEnvironment(),
         **config,
     )
 
-    info = agent.run("Test empty actions")
+    info = agent.run("What is 2 + 2?")
     assert info["exit_status"] == "Submitted"
-    assert info["submission"] == "done\n"
-    assert agent.n_calls == 2
+    assert info["submission"] == "The answer is 4."
+    assert agent.n_calls == 1
+    assert agent.messages[-1]["extra"]["direct_response"] is True
+
+
+def test_empty_submission_requests_a_final_answer(toolcall_config):
+    """An investigation followed by a bare submit marker must not leave the user without a reply."""
+    outputs = [
+        ("Let me investigate.", [{"command": "echo investigating"}]),
+        ("", [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"}]),
+        ("The database is in the global configuration directory.", []),
+    ]
+    events = []
+    agent = DefaultAgent(
+        model=make_tc_model(outputs),
+        env=LocalEnvironment(),
+        **toolcall_config,
+    )
+    agent.set_event_callback(events.append)
+
+    info = agent.run("Where is the database?")
+
+    assert info["submission"] == "The database is in the global configuration directory."
+    assert events[-1]["submission"] == info["submission"]
+    assert [event["type"] for event in events].count("assistant_message") == 3
+    assert sum(message.get("role") == "exit" for message in agent.messages) == 1
 
 
 class _FlakyToolcallModel(DeterministicToolcallModel):
@@ -542,3 +563,115 @@ def test_format_errors_count_against_cost_limit(toolcall_config, reset_global_st
     assert agent.n_calls == 3
     assert agent.cost == 3.0
     assert agent.cost == GLOBAL_MODEL_STATS.cost
+
+
+def test_stop_request_terminates_cleanly(model_factory):
+    factory, config = model_factory
+    events = []
+    agent = DefaultAgent(model=factory([]), env=LocalEnvironment(), **config)
+    agent.set_event_callback(events.append)
+
+    agent.request_stop()
+    info = agent.run("Stop immediately")
+
+    assert info["exit_status"] == "Stopped"
+    assert agent.n_calls == 0
+    assert events[-1]["type"] == "done"
+    assert events[-1]["exit_status"] == "Stopped"
+
+
+def test_stop_during_streaming_query_aborts_model_retry(toolcall_config):
+    """A stop requested from a streaming event must not trigger another model call."""
+    from minisweagent.models.utils.retry import retry
+
+    class _StreamingModel(DeterministicModel):
+        def __init__(self):
+            super().__init__(outputs=[])
+            self.attempts = 0
+
+        def stream_query(self, messages, callback):
+            for attempt in retry(logger=logging.getLogger("test"), abort_exceptions=[RuntimeError]):
+                with attempt:
+                    self.attempts += 1
+                    for _ in range(10):
+                        callback({"type": "assistant_delta", "text": "working"})
+
+    events = []
+    model = _StreamingModel()
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **toolcall_config)
+
+    def on_event(event):
+        events.append(event)
+        if event["type"] == "assistant_delta":
+            agent.request_stop()
+
+    agent.set_event_callback(on_event)
+
+    with patch("minisweagent.models.utils.retry.wait_exponential", return_value=lambda _: 0):
+        info = agent.run("Keep streaming")
+
+    assert info["exit_status"] == "Stopped"
+    assert model.attempts == 1
+    assert events[-1]["type"] == "done"
+    assert events[-1]["exit_status"] == "Stopped"
+
+
+def test_conversational_greeting_skips_tool_loop():
+    """Greetings should be answered directly instead of triggering bash searches."""
+    config = {
+        "system_template": "You are an agent.",
+        "instance_template": "Please solve this issue: {{task}}",
+    }
+    events: list[dict] = []
+    # An empty output list would raise if the agent tried to query the model.
+    agent = DefaultAgent(model=DeterministicModel(outputs=[]), env=LocalEnvironment(), **config)
+    agent.set_event_callback(events.append)
+
+    result = agent.run("hi")
+
+    assert result["exit_status"] == "Submitted"
+    assert result["submission"]
+    assert agent.n_calls == 0
+    assert [event["type"] for event in events] == ["run_start", "assistant_message", "done"]
+    assert events[1]["actions"] == []
+    assert events[1]["conversational"] is True
+
+
+def test_greeting_prefix_does_not_hide_real_task(model_factory):
+    """A greeting followed by an actual request must still run the normal agent."""
+    factory, config = model_factory
+    agent = DefaultAgent(
+        model=factory([("Done", [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho 'fixed'"}])]),
+        env=LocalEnvironment(),
+        **config,
+    )
+
+    result = agent.run("hi, please fix the failing tests")
+
+    assert result["exit_status"] == "Submitted"
+    assert result["submission"] == "fixed\n"
+    assert agent.n_calls == 1
+
+
+def test_repeated_action_sequence_stops_agent():
+    """A model stuck repeating the same turn should not loop until the cost limit."""
+    config = {
+        "system_template": "You are an agent.",
+        "instance_template": "Please solve this issue: {{task}}",
+        "max_repeated_actions": 2,
+        "cost_limit": 100.0,
+    }
+    agent = DefaultAgent(
+        model=DeterministicModel(outputs=[make_output("", []) for _ in range(10)]),
+        env=LocalEnvironment(),
+        **config,
+    )
+    events: list[dict] = []
+    agent.set_event_callback(events.append)
+
+    result = agent.run("A task that makes no progress")
+
+    assert result["exit_status"] == "RepeatedAction"
+    assert agent.n_calls == 2
+    assert events[-2]["type"] == "stalled"
+    assert events[-1]["type"] == "done"

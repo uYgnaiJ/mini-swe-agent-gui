@@ -61,3 +61,35 @@ def test_agent_emits_streaming_and_action_events(tmp_path):
     assert event_types[-1] == "done"
     assert events[-1]["exit_status"] == "Submitted"
     assert events[-1]["submission"] == "result\n"
+
+
+def test_agent_emits_cumulative_token_usage(tmp_path):
+    command = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\necho result"
+    output = make_toolcall_output(
+        "Done",
+        [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": command})},
+            }
+        ],
+        [{"command": command, "tool_call_id": "call_1"}],
+    )
+    output["extra"]["response"] = {"usage": {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}}
+    events: list[dict] = []
+    agent = DefaultAgent(
+        model=DeterministicToolcallModel(outputs=[output]),
+        env=LocalEnvironment(cwd=str(tmp_path)),
+        **_config(),
+    )
+    agent.set_event_callback(events.append)
+
+    agent.run("test task")
+
+    assistant = next(event for event in events if event["type"] == "assistant_message")
+    assert assistant["usage"] == {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}
+    assert assistant["total_tokens_used"] == 125
+    assert events[-1]["token_usage"] == {"prompt_tokens": 100, "completion_tokens": 25, "total_tokens": 125}
+    assert events[-1]["total_tokens"] == 125
+    assert agent.tokens == 125

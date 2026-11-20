@@ -6,6 +6,7 @@ import time
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.models.utils.direct_response import is_direct_response
 from minisweagent.models.utils.openai_multimodal import expand_multimodal_content
 
 BASH_TOOL = {
@@ -28,21 +29,27 @@ BASH_TOOL = {
 
 
 def parse_toolcall_actions(
-    tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
+    tool_calls: list,
+    *,
+    format_error_template: str,
+    template_kwargs: dict | None = None,
+    content: str | None = None,
 ) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args.
 
-    ``template_kwargs`` are extra variables exposed to ``format_error_template`` (e.g.
-    ``{"finish_reason": ...}`` so a template can distinguish a real format mistake from a
-    ``max_tokens`` truncation).
+    A complete response with no tool calls and non-empty text is a direct answer, so it
+    returns no actions instead of raising. ``template_kwargs`` are extra variables exposed to
+    ``format_error_template`` (e.g. ``{"finish_reason": ...}``).
     """
     template_kwargs = template_kwargs or {}
     if not tool_calls:
+        if is_direct_response(content, template_kwargs.get("finish_reason")):
+            return []
         raise FormatError(
             {
                 "role": "user",
                 "content": Template(format_error_template, undefined=StrictUndefined).render(
-                    error="No tool calls found in the response. Every response MUST include at least one tool call.",
+                    error="No tool calls found in the response. If you intended to use a tool, include at least one tool call; otherwise provide a complete direct answer.",
                     actions=[],
                     has_tool_calls=False,
                     **template_kwargs,

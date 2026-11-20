@@ -647,3 +647,31 @@ def test_output_file_is_created(tmp_path):
             print(f"Error output: {result.output}")
         assert result.exit_code == 0
         assert output_file.exists(), f"Output file {output_file} was not created"
+
+
+def test_mini_passes_images_to_agent():
+    with (
+        patch("minisweagent.run.mini.configure_if_first_time"),
+        patch("minisweagent.run.mini.get_agent") as mock_get_agent,
+        patch("minisweagent.run.mini.get_model"),
+        patch("minisweagent.run.mini.get_environment"),
+        patch("minisweagent.run.mini.get_config_from_spec") as mock_get_config,
+    ):
+        mock_get_config.return_value = {"agent": {"system_template": "test"}, "env": {}, "model": {}}
+        mock_agent = Mock()
+        mock_agent.run.return_value = {"exit_status": "Success", "submission": "Result"}
+        mock_get_agent.return_value = mock_agent
+
+        main(
+            config_spec=[str(DEFAULT_CONFIG_FILE)],
+            model_name="test-model",
+            task="Inspect this screenshot",
+            image=["https://example.com/screenshot.png"],
+            yolo=True,
+            output=None,
+            model_class=None,
+            agent_class=None,
+            environment_class=None,
+        )
+
+        mock_agent.run.assert_called_once_with("Inspect this screenshot", images=["https://example.com/screenshot.png"])

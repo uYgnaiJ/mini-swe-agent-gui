@@ -228,11 +228,12 @@ class LitellmModel:
 
     def _parse_actions(self, response) -> list[dict]:
         """Parse tool calls from the response. Raises FormatError if unknown tool."""
-        tool_calls = response.choices[0].message.tool_calls or []
+        message = response.choices[0].message
         return parse_toolcall_actions(
-            tool_calls,
+            message.tool_calls or [],
             format_error_template=self.config.format_error_template,
             template_kwargs={"finish_reason": response.choices[0].finish_reason},
+            content=message.content,
         )
 
     def format_message(self, **kwargs) -> dict:

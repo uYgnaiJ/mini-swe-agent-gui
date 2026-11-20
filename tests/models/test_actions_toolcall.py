@@ -21,6 +21,26 @@ class TestParseToolcallActions:
             parse_toolcall_actions(None, format_error_template="{{ error }}")
         assert "No tool calls found" in exc_info.value.messages[0]["content"]
 
+    def test_empty_tool_calls_with_direct_answer_returns_no_actions(self):
+        assert (
+            parse_toolcall_actions(
+                [],
+                format_error_template="{{ error }}",
+                template_kwargs={"finish_reason": "stop"},
+                content="The answer is 4.",
+            )
+            == []
+        )
+
+    def test_empty_tool_calls_with_truncated_answer_still_raises(self):
+        with pytest.raises(FormatError):
+            parse_toolcall_actions(
+                [],
+                format_error_template="{{ error }}",
+                template_kwargs={"finish_reason": "length"},
+                content="The answer is",
+            )
+
     def test_template_kwargs_exposed_to_format_error_template(self):
         template = "{% if finish_reason == 'length' %}cut off{% else %}{{ error }}{% endif %}"
         # no-tool-call path

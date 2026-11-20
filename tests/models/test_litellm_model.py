@@ -64,6 +64,19 @@ class TestLitellmModel:
 
     @patch("minisweagent.models.litellm_model.litellm.completion")
     @patch("minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost")
+    def test_parse_direct_answer_without_tool_call(self, mock_cost, mock_completion):
+        response = _mock_litellm_response(None)
+        response.choices[0].finish_reason = "stop"
+        response.choices[0].message.content = "The answer is 4."
+        mock_completion.return_value = response
+        mock_cost.return_value = 0.001
+
+        model = LitellmModel(model_name="gpt-4")
+        result = model.query([{"role": "user", "content": "What is 2 + 2?"}])
+        assert result["extra"]["actions"] == []
+
+    @patch("minisweagent.models.litellm_model.litellm.completion")
+    @patch("minisweagent.models.litellm_model.litellm.cost_calculator.completion_cost")
     def test_finish_reason_threaded_into_format_error_template(self, mock_cost, mock_completion):
         """The response finish_reason is exposed to format_error_template via template_kwargs, so a
         config can report a max_tokens truncation instead of the misleading "no tool call" error."""

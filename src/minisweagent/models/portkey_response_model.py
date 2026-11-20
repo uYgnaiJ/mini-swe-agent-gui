@@ -17,6 +17,7 @@ from minisweagent.models.utils.actions_toolcall_response import (
     parse_toolcall_actions_response,
 )
 from minisweagent.models.utils.retry import retry
+from minisweagent.utils.images import to_responses_api_content
 
 logger = logging.getLogger("portkey_response_model")
 
@@ -90,7 +91,10 @@ class PortkeyResponseAPIModel:
                 for item in msg.get("output", []):
                     result.append({k: v for k, v in item.items() if k != "extra"})
             else:
-                result.append({k: v for k, v in msg.items() if k != "extra"})
+                item = {k: v for k, v in msg.items() if k != "extra"}
+                if "content" in item:
+                    item["content"] = to_responses_api_content(item["content"])
+                result.append(item)
         return result
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
@@ -149,7 +153,9 @@ class PortkeyResponseAPIModel:
         role = kwargs.get("role", "user")
         content = kwargs.get("content", "")
         extra = kwargs.get("extra")
-        content_items = [{"type": "input_text", "text": content}] if isinstance(content, str) else content
+        content_items = (
+            [{"type": "input_text", "text": content}] if isinstance(content, str) else to_responses_api_content(content)
+        )
         msg = {"type": "message", "role": role, "content": content_items}
         if extra:
             msg["extra"] = extra

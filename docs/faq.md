@@ -56,6 +56,23 @@
 
     The `.env` file is a simple key-value file that is read by the `dotenv` library.
 
+??? question "Does mini-SWE-agent support image input?"
+
+    Yes. Attach images from the `mini` command line with repeated `--image`
+    options, or use the **+** button (or paste/drop) in `mini-gui`.
+    The images are included in the first user message, so you need a
+    vision-capable (multimodal) model. Local files are inlined as data URLs;
+    `http(s)` URLs are passed through to the model provider.
+
+??? question "Where are GUI conversations stored?"
+
+    GUI conversations are stored in a SQLite database named `gui_conversations.db`
+    in the global configuration directory. The exact path is printed when `mini-gui`
+    starts and is shown in the GUI header. You can also query it with
+    `mini-gui --help`, `GET /api/config`, or `GET /api/database`.
+
+    Use `--database PATH` (or `MSWEA_GUI_DB_PATH`) to choose a different database file.
+
 
 ## Models
 

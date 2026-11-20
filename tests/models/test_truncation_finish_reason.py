@@ -69,6 +69,36 @@ class TestRegexActionsTemplateKwargs:
         assert "found 0" in exc.value.messages[0]["content"]
 
 
+class TestDirectAnswerWithoutToolCall:
+    def test_text_model_accepts_complete_direct_answer(self):
+        assert (
+            parse_regex_actions(
+                "The answer is 4.",
+                action_regex=r"```bash\n(.*?)\n```",
+                format_error_template="{{ error }}",
+                template_kwargs={"finish_reason": "stop"},
+            )
+            == []
+        )
+
+    def test_response_model_accepts_complete_direct_answer(self):
+        output = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "The answer is 4."}],
+            }
+        ]
+        assert (
+            parse_toolcall_actions_response(
+                output,
+                format_error_template="{{ error }}",
+                template_kwargs={"finish_reason": "completed"},
+            )
+            == []
+        )
+
+
 class TestResponseActionsTemplateKwargs:
     def test_finish_reason_reported_on_no_tool_calls(self):
         with pytest.raises(FormatError) as exc:

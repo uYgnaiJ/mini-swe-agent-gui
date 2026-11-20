@@ -1,7 +1,9 @@
 from unittest.mock import patch
 
+import pytest
 from litellm.types.utils import ModelResponse, StreamingChoices
 
+from minisweagent.exceptions import UserInterruption
 from minisweagent.models.litellm_model import LitellmModel
 
 
@@ -81,3 +83,32 @@ def test_stream_query_falls_back_for_non_streaming_models():
         {"type": "assistant_delta", "text": "Final answer"},
         {"type": "assistant_end"},
     ]
+
+
+def test_stream_query_does_not_retry_user_interruptions():
+    """A stop request raised from the streaming callback must abort promptly.
+
+    The GUI stops a run by raising ``UserInterruption`` from the event callback.
+    Retrying that exception would launch another model request and make the Stop
+    button appear to do nothing.
+    """
+    completion_calls = 0
+
+    def completion(*args, **kwargs):
+        nonlocal completion_calls
+        completion_calls += 1
+        return iter([_make_chunk("still running")])
+
+    def callback(event):
+        if event["type"] == "assistant_delta":
+            raise UserInterruption({"role": "exit", "content": "Stopped by user"})
+
+    model = LitellmModel(model_name="gpt-4o-mini")
+    with (
+        patch("litellm.completion", side_effect=completion),
+        patch("minisweagent.models.utils.retry.wait_exponential", return_value=lambda _: 0),
+    ):
+        with pytest.raises(UserInterruption):
+            model.stream_query([{"role": "user", "content": "test"}], callback)
+
+    assert completion_calls == 1

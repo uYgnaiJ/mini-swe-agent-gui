@@ -1,15 +1,100 @@
 # Web GUI
 
 `mini-gui` starts a small browser-based interface for mini-SWE-agent. It uses
-Server-Sent Events (SSE) to stream the model response token by token, and shows
-each bash command and its output as the agent works.
+Server-Sent Events (SSE) to stream the model response token by token. Assistant
+messages read as a plain transcript instead of a stack of step cards, and each
+bash command is a quiet one-line row showing only the command and its exit
+status. A run has explicit **Run started** and **Run finished** markers.
 
 ```bash
 mini-gui
 ```
 
 The command prints a URL such as `http://127.0.0.1:8000` and opens it in your
-default browser. Enter a task in the text box and press **Run agent**.
+default browser. The text box starts as a compact single-line composer. Enter a
+task and press **Send**; while a run is active, the button changes to **Stop**.
+After a run finishes or is stopped, the button switches back to **Send** and you
+can keep typing follow-up messages in the same conversation.
+
+## Image input
+
+Use the **+** button to the left of the task input to add one or more
+screenshots or diagrams, or paste/drop an image directly into the task box. Attachments are
+shown as thumbnails before the run starts and can be removed individually.
+You can also send an image without any text; the agent will be asked to analyze
+the attached image. The images are included in the first user message, stored
+with the conversation, and shown when a conversation is reloaded.
+
+Image input requires a multimodal model. Up to 8 images can be attached per
+conversation, with a 20 MB limit per image.
+
+## Conversations
+
+Every run started through the GUI appears in the **Conversations** sidebar.
+Click a conversation to load its task, messages, commands, status, and cost
+again. Conversations that are still running keep streaming while selected.
+Use **New** to clear the view and start another task.
+
+Simple greetings and small-talk messages (for example, "hi", "hello", or
+"thanks") are answered immediately instead of being sent through the bash
+tool loop. Messages that contain an actual request, such as
+"hi, please fix the failing tests", still start a normal agent run. The same
+guard is used by the Python agent classes, so short conversations cannot
+accidentally trigger repository searches.
+
+Each conversation shows the first eight characters of its conversation ID and
+its workspace directory next to its name in the sidebar. The workspace is taken
+from the environment's ``cwd`` setting; if that is unset, the GUI process's
+current working directory is used.
+
+The selected conversation is remembered in the URL and browser session storage.
+If you refresh the page while an agent is running, the GUI reconnects to that
+session and replays its events, so the run remains visible and can still be
+stopped. The agent itself keeps running on the server while the page is closed.
+
+Conversations are persisted in SQLite as they run. The default database is
+`gui_conversations.db` in mini-SWE-agent's global configuration directory. On
+startup, the GUI restores the conversation list, summaries, and streamed events
+from this database, so conversations remain available after restarting the
+server. Each conversation update is written immediately, and runs interrupted by
+a server restart are marked as `Interrupted`.
+
+The exact database path is printed when `mini-gui` starts, shown in the GUI
+header, and returned by `GET /api/config` and `GET /api/database`. The location
+depends on your operating system:
+
+| Platform | Default path |
+| --- | --- |
+| macOS | `~/Library/Application Support/mini-swe-agent/gui_conversations.db` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/mini-swe-agent/gui_conversations.db` |
+| Windows | under `%LOCALAPPDATA%` (the exact path is printed at startup) |
+
+Set the `MSWEA_GLOBAL_CONFIG_DIR` environment variable to move the whole
+configuration directory, or use `--database PATH` / `MSWEA_GUI_DB_PATH` to
+choose only the database file.
+
+A conversation can be downloaded as a self-contained JSON trajectory,
+including its event stream, token/cost summary, and the latest agent trajectory
+when available, from `/api/conversations/<session-id>/export`.
+
+
+## Conversation states
+
+Every conversation has one of five canonical states:
+
+| State | Meaning |
+| --- | --- |
+| `running` | The agent is still working. |
+| `submitted` | The agent finished by submitting a result (`Submitted`). |
+| `stopped` | The run was stopped by the user. |
+| `failed` | The run ended with an error or a limit was exceeded. |
+| `interrupted` | The server stopped before the run finished. |
+
+The raw agent `exit_status` remains available as `status` and `exit_status` in
+the conversation metadata. The normalized state is available as `state`.
+`GET /api/conversations` also returns `states`, `state_count`, and
+`state_counts`, and `GET /api/conversations/statuses` returns the same state
+list and counts on their own.
 
 ## Options
 
@@ -29,6 +114,7 @@ Useful flags:
 | `-c`, `--config` | Config file(s) or `key=value` overrides |
 | `-t`, `--task` | Prefill the task text box |
 | `-o`, `--output` | Trajectory output path |
+| `--database`, `--db` | SQLite conversation database path |
 | `--host` / `--port` | Bind address (the default is local-only `127.0.0.1:8000`) |
 | `--browser` / `--no-browser` | Open or do not open a browser |
 
@@ -37,6 +123,36 @@ not ask for command confirmation in the browser. Only expose it on an untrusted
 network if you understand that anyone who can reach it can ask the agent to run
 commands in the configured environment.
 
+## Activity timeline
+
+The right-hand **Activity** panel is a compact, turn-aware ledger of the run,
+modelled after the trajectory view in DeepSeek Harness. Instead of an
+undifferentiated log, it shows the events in the order they happened:
+
+- **Run started** marks the task and starts the elapsed timer.
+- **Step N** rows group one model turn. A numbered marker identifies the step,
+  and the row is updated as the model thinks, writes a response, or requests a
+  command.
+- **Bash command** rows appear under the step that requested them and show the
+  command and exit status. The full command text, duration, and captured output
+  are shown when the Activity view is expanded.
+- **Run finished** reports the final exit status, submission preview, cost, and
+  token totals.
+
+The header summarises the number of model steps, tool runs, errors, and elapsed
+time. The colour strip is a compact overview of the same timeline: blue segments
+are model turns, amber segments are tool runs, green is a successful finish, and
+red marks an error. The compact panel never scrolls; it keeps the most recent
+activity rows that fit in the available space and drops older rows from view.
+Use **Expand** in the Activity header to turn the right rail into a full-width
+timeline over the conversation area. In that view every activity is shown as a
+readable row with its command and result details, and the timeline scrolls
+vertically. It follows the newest activity until you scroll up to inspect older
+entries. Press **Collapse** or Escape to return to the conversation. On narrower
+windows where the right rail is hidden, use **Activity** in the conversation
+toolbar to open the timeline. Every conversation also retains this timeline when
+selected again.
+
 ## Streaming
 
 Streaming is implemented by `LitellmModel.stream_query()`, which requests a
@@ -44,4 +160,13 @@ stream from the provider, emits `assistant_delta` events through an optional
 agent callback, and then feeds the assembled response through the normal action
 parsing and execution path. Other model implementations that do not support
 streaming still work: the GUI displays their final assistant message when the
-query returns.
+query returns. After every model call, the run panel shows cumulative input and
+output token usage, and each assistant message reports the tokens consumed by
+that step.
+
+The transcript keeps tool calls deliberately lightweight: a command is shown as
+one `$ command` line with its exit status, without numbered badges, nested cards,
+or inline output. Click any tool line to open Activity Expand and jump to its
+entry, where the full command, timing, token/cost metadata, and captured output
+are available. Long output stays out of the conversation transcript so it does
+not overwhelm the messages that matter.

@@ -22,5 +22,9 @@ class UserInterruption(InterruptAgentFlow):
     """Raised when the user interrupts the agent."""
 
 
+class RepeatedAction(InterruptAgentFlow):
+    """Raised when the model gets stuck repeating the same action."""
+
+
 class FormatError(InterruptAgentFlow):
     """Raised when the LM's output is not in the expected format."""

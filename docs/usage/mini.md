@@ -22,7 +22,20 @@ Useful switches:
 - `-c`/`--config`: Specify a config file to use, else we will use [`mini.yaml`](https://github.com/swe-agent/mini-swe-agent/blob/main/src/minisweagent/config/mini.yaml) or the config `MSWEA_MINI_CONFIG_PATH` environment variable (see [global configuration](../advanced/global_configuration.md)).
   It's enough to specify the name of the config file, e.g., `-c mini.yaml` (see [global configuration](../advanced/global_configuration.md) for how it is resolved).
 - `-m`/`--model`: Specify a model to use, else we will use the model `MSWEA_MODEL_NAME` environment variable (see [global configuration](../advanced/global_configuration.md))
+- `-i`/`--image`: Attach an image to the task. Accepts a local file path, an `http(s)` URL, or a `data:image/...` URL; repeat the option for multiple images.
 - `-y`/`--yolo`: Start in `yolo` mode (see below)
+
+## Image input
+
+Attach screenshots, diagrams, or other images to the task with `--image`:
+
+```bash
+mini -t "What is wrong with the layout in this screenshot?" --image screenshot.png
+mini -t "Compare these two designs" --image before.png --image after.png
+```
+
+Local files are inlined as data URLs before the first user message is sent. Remote image URLs are passed through unchanged.
+Image attachments require a multimodal model (for example a vision-capable GPT, Claude, Gemini, or Qwen model); text-only models cannot interpret them.
 
 ## Modes of operation
 

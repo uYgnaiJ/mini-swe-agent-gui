@@ -27,4 +27,18 @@ agent = DefaultAgent(
 agent.run(task)
 ```
 
+## Image input
+
+Pass local paths, `http(s)` URLs, or data URLs through the `images` argument:
+
+```python
+agent.run(
+    "What is wrong with the layout in this screenshot?",
+    images=["screenshot.png"],
+)
+```
+
+Images are attached to the first user message as multimodal content blocks.
+Choose a vision-capable model when using this feature.
+
 {% include-markdown "../_footer.md" %}
