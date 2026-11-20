@@ -2,6 +2,7 @@
 or https://minimal-agent.com for a tutorial on the basic building principles.
 """
 
+import copy
 import json
 import logging
 import threading
@@ -216,14 +217,9 @@ class DefaultAgent:
             )
         )
 
-    def run(self, task: str = "", images: list | None = None, image: object = None, **kwargs) -> dict:
-        """Run step() until agent is finished.
-
-        ``images`` (or the singular ``image`` alias) may contain local paths,
-        http(s) URLs, data URLs, or raw bytes.  They are attached to the first
-        user message so multimodal models can inspect them alongside the task
-        text.
-        """
+    @staticmethod
+    def _normalize_run_images(images: list | None, image: object = None) -> list[str]:
+        """Return model-ready URLs for the supported image argument aliases."""
         if image is not None:
             if images is None:
                 images = [image]
@@ -231,12 +227,16 @@ class DefaultAgent:
                 images = [*images, image]
             else:
                 images = [images, image]
-        image_urls = normalize_images(images)
-        self.extra_template_vars |= {"task": task, "images": image_urls, **kwargs}
-        self.messages = []
+        return normalize_images(images)
+
+    def _reset_turn_state(self) -> None:
+        """Reset per-turn bookkeeping without clearing the conversation."""
         self._last_action_signature = None
         self._n_repeated_actions = 0
         self._n_empty_submission_retries = 0
+        self.n_consecutive_format_errors = 0
+
+    def _emit_run_start(self, task: str, image_urls: list[str]) -> None:
         self._emit(
             {
                 "type": "run_start",
@@ -246,15 +246,9 @@ class DefaultAgent:
                 "cost_limit": self.config.cost_limit,
             }
         )
-        task_content = build_multimodal_content(self._render_template(self.config.instance_template), image_urls)
-        self.add_messages(
-            self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
-            self.model.format_message(role="user", content=task_content),
-        )
-        # Short greetings should not skip over an attached image.
-        conversational_result = self._complete_conversational_task(task) if not image_urls else None
-        if conversational_result is not None:
-            return conversational_result
+
+    def _run_until_finished(self) -> dict:
+        """Run the agent loop until the last message is an exit message."""
         while True:
             try:
                 self._raise_if_stop_requested()
@@ -328,6 +322,82 @@ class DefaultAgent:
         result = self.messages[-1].get("extra", {})
         self._emit(self._done_event(result))
         return result
+
+    def _drop_trailing_exit_messages(self) -> None:
+        """Remove internal exit messages before a follow-up turn.
+
+        ``exit`` is an internal role that records why a run ended.  It is not
+        part of the chat transcript and must not be sent to the model when the
+        user adds another instruction to the same conversation.
+        """
+        while self.messages and self.messages[-1].get("role") == "exit":
+            self.messages.pop()
+
+    def run(self, task: str = "", images: list | None = None, image: object = None, **kwargs) -> dict:
+        """Run step() until agent is finished.
+
+        ``images`` (or the singular ``image`` alias) may contain local paths,
+        http(s) URLs, data URLs, or raw bytes.  They are attached to the first
+        user message so multimodal models can inspect them alongside the task
+        text.
+        """
+        image_urls = self._normalize_run_images(images, image)
+        self.extra_template_vars |= {"task": task, "images": image_urls, **kwargs}
+        self.messages = []
+        self._reset_turn_state()
+        self._emit_run_start(task, image_urls)
+        task_content = build_multimodal_content(self._render_template(self.config.instance_template), image_urls)
+        self.add_messages(
+            self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
+            self.model.format_message(role="user", content=task_content),
+        )
+        # Short greetings should not skip over an attached image.
+        conversational_result = self._complete_conversational_task(task) if not image_urls else None
+        if conversational_result is not None:
+            return conversational_result
+        return self._run_until_finished()
+
+    def continue_run(
+        self,
+        task: str = "",
+        images: list | None = None,
+        image: object = None,
+        messages: list[dict] | None = None,
+        **kwargs,
+    ) -> dict:
+        """Append a follow-up turn and keep the existing conversation context.
+
+        Unlike :meth:`run`, this method deliberately does not clear
+        ``self.messages`` or render ``instance_template`` again.  The model sees
+        the previous user instructions, assistant tool calls, and observations,
+        followed by the new user instruction.  This is what makes a GUI
+        follow-up a continuation of the same conversation rather than a fresh
+        agent run.
+
+        ``messages`` allows a freshly constructed agent (for example after a
+        GUI server restart) to be seeded with the persisted conversation
+        history before the new turn starts.
+        """
+        image_urls = self._normalize_run_images(images, image)
+        if messages is not None:
+            self.messages = copy.deepcopy(messages)
+        if not self.messages:
+            # Nothing to continue; behave like a normal first run.  The image
+            # URLs are already normalized, which normalize_images accepts.
+            return self.run(task, images=image_urls, **kwargs)
+        self.extra_template_vars |= {"task": task, "images": image_urls, **kwargs}
+        self._reset_turn_state()
+        self._drop_trailing_exit_messages()
+        follow_up_text = task or "Please analyze the attached image."
+        self.add_messages(
+            self.model.format_message(role="user", content=build_multimodal_content(follow_up_text, image_urls))
+        )
+        self._emit_run_start(task, image_urls)
+        # Short greetings should not skip over an attached image.
+        conversational_result = self._complete_conversational_task(task) if not image_urls else None
+        if conversational_result is not None:
+            return conversational_result
+        return self._run_until_finished()
 
     def _should_retry_empty_submission(self, error: Submitted) -> bool:
         if self._n_empty_submission_retries >= self.config.max_empty_submission_retries:

@@ -1,4 +1,5 @@
 import logging
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -675,3 +676,38 @@ def test_repeated_action_sequence_stops_agent():
     assert agent.n_calls == 2
     assert events[-2]["type"] == "stalled"
     assert events[-1]["type"] == "done"
+
+
+def test_continue_run_preserves_conversation_context():
+    """A follow-up turn must append to, not replace, earlier instructions."""
+    config = {
+        "system_template": "You are an agent.",
+        "instance_template": "Please solve this issue: {{task}}",
+        "cost_limit": 100.0,
+    }
+
+    class RecordingModel(DeterministicModel):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.queries: list[list[dict]] = []
+
+        def query(self, messages, **kwargs):
+            self.queries.append(deepcopy(messages))
+            return super().query(messages, **kwargs)
+
+    model = RecordingModel(outputs=[make_output("answer one", []), make_output("answer two", [])])
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **config)
+
+    agent.run("first instruction")
+    result = agent.continue_run("second instruction")
+
+    assert result["submission"] == "answer two"
+    assert len(model.queries) == 2
+    second_turn = model.queries[1]
+    assert [message.get("role") for message in second_turn] == ["system", "user", "assistant", "user"]
+    assert "first instruction" in get_text(second_turn[1])
+    assert "second instruction" in get_text(second_turn[3])
+    assert all(message.get("role") != "exit" for message in second_turn)
+    # Both user instructions are still in the agent's cumulative transcript.
+    assert "first instruction" in " ".join(get_text(message) for message in agent.messages)
+    assert "second instruction" in " ".join(get_text(message) for message in agent.messages)

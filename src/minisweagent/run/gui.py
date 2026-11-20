@@ -11,13 +11,17 @@ lightweight and avoids adding another web-framework dependency to the package.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 import webbrowser
 from collections.abc import Callable
@@ -27,7 +31,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 
 import typer
 from rich.console import Console
@@ -48,6 +52,817 @@ logger = logging.getLogger("minisweagent.gui")
 DEFAULT_CONFIG_FILE = Path(builtin_config_dir / "mini.yaml")
 DEFAULT_OUTPUT_FILE = global_config_dir / "last_gui_run.traj.json"
 DEFAULT_DATABASE_FILE = Path(os.getenv("MSWEA_GUI_DB_PATH") or global_config_dir / "gui_conversations.db")
+DEFAULT_SETTINGS_FILE = Path(os.getenv("MSWEA_GUI_SETTINGS_PATH") or global_config_dir / "gui_settings.json")
+
+
+class SettingsConflictError(ValueError):
+    """Raised when a provider or model would be created twice."""
+
+
+class SettingsNotFoundError(ValueError):
+    """Raised when a provider or model cannot be found."""
+
+
+_PROVIDER_DEFAULTS: dict[str, tuple[str, str, str]] = {
+    "openai": ("OpenAI", "OPENAI_API_KEY", "https://api.openai.com/v1"),
+    "anthropic": ("Anthropic", "ANTHROPIC_API_KEY", ""),
+    "gemini": ("Google Gemini", "GEMINI_API_KEY", ""),
+    "openrouter": ("OpenRouter", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
+    "portkey": ("Portkey", "PORTKEY_API_KEY", ""),
+    "requesty": ("Requesty", "REQUESTY_API_KEY", ""),
+    "azure": ("Azure OpenAI", "AZURE_API_KEY", ""),
+    "deepseek": ("DeepSeek", "DEEPSEEK_API_KEY", ""),
+    "groq": ("Groq", "GROQ_API_KEY", ""),
+    "mistral": ("Mistral", "MISTRAL_API_KEY", ""),
+    "xai": ("xAI", "XAI_API_KEY", ""),
+    "ollama": ("Ollama", "OLLAMA_API_KEY", "http://localhost:11434"),
+    "vllm": ("vLLM", "VLLM_API_KEY", "http://localhost:8000/v1"),
+    "together": ("Together AI", "TOGETHER_API_KEY", ""),
+    "cohere": ("Cohere", "COHERE_API_KEY", ""),
+}
+
+# LiteLLM expects model names to include their provider prefix. Model-list
+# endpoints normally return provider-local IDs (for example ``gpt-4o``), so
+# loaded models have to be qualified before they can be called.
+_PROVIDER_MODEL_PREFIXES: dict[str, str] = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "gemini": "gemini",
+    "openrouter": "openrouter",
+    "portkey": "portkey",
+    "requesty": "requesty",
+    "azure": "azure",
+    "deepseek": "deepseek",
+    "groq": "groq",
+    "mistral": "mistral",
+    "xai": "xai",
+    "ollama": "ollama",
+    "vllm": "openai",
+    "together": "together_ai",
+    "cohere": "cohere",
+}
+
+
+def _slugify(value: Any) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug or "provider"
+
+
+_SECRET_LIKE_PATTERN = re.compile(r"(?i)^(?:sk[-_]|pk[-_]|xox[baprs]-|ghp_|github_pat_|AIza|ya29\.)")
+
+
+def _validate_api_key_env_name(value: Any) -> None:
+    """Reject accidental API keys in the environment-variable-name field.
+
+    The field is meant to hold a variable name such as ``OPENAI_API_KEY``. A
+    pasted secret normally has whitespace, is much longer than a variable name,
+    or carries a provider-specific prefix. Catching those cases here gives a
+    useful error even when the GUI's client-side validation is bypassed.
+    """
+    env_name = str(value or "").strip()
+    if not env_name:
+        return
+    if any(char.isspace() for char in env_name) or len(env_name) > 80 or _SECRET_LIKE_PATTERN.match(env_name):
+        raise ValueError(
+            "The API key environment variable must be a variable name such as OPENAI_API_KEY, "
+            "not the API key itself. Paste the secret key into the API key field instead."
+        )
+
+
+def _provider_from_model(model_name: str) -> str:
+    value = str(model_name or "").strip()
+    if not value:
+        return ""
+    if "/" in value:
+        return _slugify(value.split("/", 1)[0])
+    return _slugify(value.split("-", 1)[0])
+
+
+def _qualified_model_name(provider_id: str, model_name: str) -> str:
+    """Add the provider prefix LiteLLM needs to a provider-local model name."""
+    name = str(model_name or "").strip()
+    if not name:
+        return name
+    prefix = _PROVIDER_MODEL_PREFIXES.get(_slugify(provider_id), "openai")
+    return name if name == prefix or name.startswith(f"{prefix}/") else f"{prefix}/{name}"
+
+
+def _model_is_enabled_by_provider(model: dict[str, Any], providers: list[dict[str, Any]]) -> bool:
+    provider_id = str(model.get("provider") or "")
+    if not provider_id:
+        return True
+    provider = next((item for item in providers if item.get("id") == provider_id), None)
+    return True if provider is None else bool(provider.get("enabled", True))
+
+
+class ProviderModelQueryError(ValueError):
+    """Raised when a provider's model list cannot be retrieved."""
+
+
+_PROVIDER_MODELS_BASE_URLS: dict[str, str] = {
+    "anthropic": "https://api.anthropic.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "deepseek": "https://api.deepseek.com/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "xai": "https://api.x.ai/v1",
+    "together": "https://api.together.xyz/v1",
+    "cohere": "https://api.cohere.com/v1",
+    "portkey": "https://api.portkey.ai/v1",
+    "requesty": "https://router.requesty.ai/v1",
+    "ollama": "http://localhost:11434",
+    "vllm": "http://localhost:8000/v1",
+}
+
+
+def _provider_api_key(provider: dict[str, Any]) -> str:
+    """Return a stored key, falling back to the provider's configured env var."""
+    api_key = str(provider.get("api_key") or "").strip()
+    if api_key:
+        return api_key
+    env_name = str(provider.get("api_key_env") or "").strip()
+    return os.getenv(env_name, "").strip() if env_name else ""
+
+
+def _provider_models_endpoint(provider: dict[str, Any]) -> tuple[str, str]:
+    """Build the provider's model-list endpoint and return it with the API key."""
+    provider_id = _slugify(provider.get("id"))
+    base_url = str(provider.get("base_url") or _PROVIDER_MODELS_BASE_URLS.get(provider_id) or "").strip()
+    if not base_url:
+        raise ProviderModelQueryError(
+            f"Provider {provider_id!r} has no base URL. Add the provider's API base URL before loading models."
+        )
+    endpoint = base_url.rstrip("/")
+    if re.search(r"/(?:models|api/tags)$", endpoint):
+        pass
+    elif provider_id == "ollama" and not endpoint.rstrip("/").endswith("/v1"):
+        endpoint += "/api/tags"
+    elif provider_id == "openai" and endpoint == "https://api.openai.com":
+        endpoint += "/v1/models"
+    else:
+        endpoint += "/models"
+    api_key = _provider_api_key(provider)
+    if provider_id == "gemini" and api_key:
+        separator = "&" if "?" in endpoint else "?"
+        endpoint += separator + urlencode({"key": api_key})
+    return endpoint, api_key
+
+
+def _extract_provider_models(payload: Any) -> list[dict[str, str]]:
+    """Normalize the common model-list response shapes returned by providers."""
+    items: list[Any] = []
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "models", "results", "items", "available_models"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+            if isinstance(value, dict):
+                nested = _extract_provider_models(value)
+                if nested:
+                    return nested
+        if not items and any(payload.get(key) for key in ("id", "model", "model_name", "name")):
+            items = [payload]
+
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, str):
+            model_name = item.strip()
+            display_name = model_name
+        elif isinstance(item, dict):
+            model_name = str(
+                item.get("id") or item.get("model_name") or item.get("model") or item.get("name") or ""
+            ).strip()
+            display_name = str(
+                item.get("display_name") or item.get("displayName") or item.get("name") or model_name
+            ).strip()
+        else:
+            continue
+        if not model_name or model_name in seen:
+            continue
+        seen.add(model_name)
+        models.append({"model_name": model_name, "name": display_name or model_name})
+    return models
+
+
+def _query_provider_models(provider: dict[str, Any], *, timeout: float = 15.0) -> list[dict[str, str]]:
+    """Query an OpenAI-compatible (or known provider) model-list endpoint."""
+    endpoint, api_key = _provider_models_endpoint(provider)
+    provider_id = _slugify(provider.get("id"))
+    headers = {"Accept": "application/json", "User-Agent": "mini-swe-agent-gui"}
+    if api_key:
+        if provider_id == "anthropic":
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+        elif provider_id == "gemini":
+            headers["x-goog-api-key"] = api_key
+        elif provider_id == "azure":
+            headers["api-key"] = api_key
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+    request = urllib.request.Request(endpoint, headers=headers, method="GET")
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+        try:
+            body = response.read()
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:  # noqa: BLE001 - best-effort diagnostic only
+            pass
+        message = f"Could not load models from {provider.get('name') or provider_id}: HTTP {exc.code}"
+        if detail:
+            message += f": {detail[:500]}"
+        raise ProviderModelQueryError(message) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise ProviderModelQueryError(
+            f"Could not load models from {provider.get('name') or provider_id}: {reason}"
+        ) from exc
+
+    try:
+        payload = json.loads(body if isinstance(body, str) else body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProviderModelQueryError(
+            f"Provider {provider.get('name') or provider_id} returned a non-JSON model list."
+        ) from exc
+    return _extract_provider_models(payload)
+
+
+class GuiModelSettings:
+    """Provider/model settings used by the GUI model switcher.
+
+    The file is intentionally a small JSON document rather than a database
+    migration: it contains only a handful of user-managed providers and model
+    names and can be edited independently of the conversation history.
+    """
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        default_model: str = "",
+        default_model_class: str = "",
+    ) -> None:
+        self.path = Path(path or DEFAULT_SETTINGS_FILE)
+        self.default_model = str(default_model or "").strip()
+        self.default_model_class = str(default_model_class or "").strip()
+        self.active_model = ""
+        self.providers: list[dict[str, Any]] = []
+        self.models: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
+        self._load()
+        self._ensure_defaults()
+
+    @staticmethod
+    def _copy(value: Any) -> Any:
+        return copy.deepcopy(value)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read GUI model settings from %s", self.path, exc_info=True)
+            return
+        if not isinstance(payload, dict):
+            return
+        self.active_model = str(payload.get("active_model") or payload.get("model_name") or "").strip()
+        providers = payload.get("providers")
+        if isinstance(providers, list):
+            for provider in providers:
+                if isinstance(provider, dict) and provider.get("id"):
+                    self.providers.append(self._normalize_provider(provider))
+        models = payload.get("models")
+        if isinstance(models, list):
+            for model in models:
+                if isinstance(model, dict):
+                    normalized = self._normalize_model(model)
+                    if normalized["model_name"]:
+                        self.models.append(normalized)
+        self._deduplicate()
+
+    def _deduplicate(self) -> None:
+        seen_providers: set[str] = set()
+        unique_providers: list[dict[str, Any]] = []
+        for provider in self.providers:
+            provider_id = str(provider.get("id") or "")
+            if provider_id and provider_id not in seen_providers:
+                seen_providers.add(provider_id)
+                unique_providers.append(provider)
+        self.providers = unique_providers
+        seen_models: set[str] = set()
+        unique_models: list[dict[str, Any]] = []
+        for model in self.models:
+            model_name = str(model.get("model_name") or "")
+            if model_name and model_name not in seen_models:
+                seen_models.add(model_name)
+                unique_models.append(model)
+        self.models = unique_models
+
+    @staticmethod
+    def _normalize_provider(provider: dict[str, Any]) -> dict[str, Any]:
+        name = str(provider.get("name") or provider.get("provider_name") or provider.get("id") or "Provider").strip()
+        provider_id = _slugify(provider.get("id") or provider.get("provider_id") or provider.get("provider") or name)
+        defaults = _PROVIDER_DEFAULTS.get(provider_id, (name, f"{provider_id.upper().replace('-', '_')}_API_KEY", ""))
+        return {
+            "id": provider_id,
+            "name": name or defaults[0],
+            "enabled": bool(provider.get("enabled", True)),
+            "api_key_env": str(provider.get("api_key_env") or defaults[1]),
+            "base_url": str(provider.get("base_url") or defaults[2]),
+            "api_key": str(provider.get("api_key") or ""),
+            "has_api_key": bool(provider.get("api_key") or provider.get("has_api_key")),
+        }
+
+    @staticmethod
+    def _normalize_model(model: dict[str, Any]) -> dict[str, Any]:
+        model_name = str(
+            model.get("model_name") or model.get("model") or model.get("name") or model.get("id") or ""
+        ).strip()
+        provider = str(model.get("provider") or model.get("provider_id") or "").strip()
+        if not provider:
+            provider = _provider_from_model(model_name)
+        return {
+            "id": model_name,
+            "model_name": model_name,
+            "name": str(model.get("name") or model_name).strip(),
+            "provider": provider,
+            "model_class": str(model.get("model_class") or "").strip(),
+            "enabled": bool(model.get("enabled", True)),
+        }
+
+    def _ensure_defaults(self) -> None:
+        persisted_active = bool(self.active_model)
+        if self.default_model:
+            self._ensure_model(
+                self.default_model,
+                provider=_provider_from_model(self.default_model),
+                model_class=self.default_model_class,
+                enabled=True,
+            )
+            if not persisted_active:
+                self.active_model = self.default_model
+        if not self.active_model:
+            enabled = self._enabled_models_locked()
+            if enabled:
+                self.active_model = str(enabled[0]["model_name"])
+        elif not any(model.get("model_name") == self.active_model for model in self.models):
+            enabled = self._enabled_models_locked()
+            self.active_model = str(enabled[0]["model_name"]) if enabled else self.default_model
+        self._ensure_active_model_locked()
+
+    def _ensure_provider(self, provider_id: str) -> dict[str, Any]:
+        provider = next((item for item in self.providers if item.get("id") == provider_id), None)
+        if provider is not None:
+            return provider
+        default_name = _PROVIDER_DEFAULTS.get(provider_id, (provider_id.replace("-", " ").title(),))[0]
+        provider = self._normalize_provider({"id": provider_id, "name": default_name})
+        self.providers.append(provider)
+        return provider
+
+    def _ensure_model(
+        self, model_name: str, *, provider: str = "", model_class: str = "", enabled: bool = True
+    ) -> dict[str, Any]:
+        model = next((item for item in self.models if item.get("model_name") == model_name), None)
+        if model is not None:
+            return model
+        provider_id = _slugify(provider) if provider else _provider_from_model(model_name)
+        self._ensure_provider(provider_id)
+        model = self._normalize_model(
+            {
+                "model_name": model_name,
+                "name": model_name,
+                "provider": provider_id,
+                "model_class": model_class,
+                "enabled": enabled,
+            }
+        )
+        if not model["provider"]:
+            model["provider"] = provider_id
+        self.models.append(model)
+        return model
+
+    def _find_provider_locked(self, provider_id: str) -> dict[str, Any]:
+        key = unquote(str(provider_id or ""))
+        provider = next((item for item in self.providers if item.get("id") == key or item.get("name") == key), None)
+        if provider is None:
+            raise SettingsNotFoundError(f"Unknown provider: {key}")
+        return provider
+
+    def _find_model_locked(self, model_name: str) -> dict[str, Any]:
+        key = unquote(str(model_name or ""))
+        model = next(
+            (item for item in self.models if item.get("model_name") == key or item.get("id") == key),
+            None,
+        )
+        if model is None:
+            raise SettingsNotFoundError(f"Unknown model: {key}")
+        return model
+
+    def _enabled_models_locked(self) -> list[dict[str, Any]]:
+        return [
+            self._copy(model)
+            for model in self.models
+            if model.get("enabled", True) and _model_is_enabled_by_provider(model, self.providers)
+        ]
+
+    def list_providers(self) -> list[dict[str, Any]]:
+        with self._lock:
+            providers = self._copy(self.providers)
+            model_counts: dict[str, int] = {}
+            provider_models: dict[str, list[str]] = {}
+            for model in self.models:
+                provider = str(model.get("provider") or "")
+                model_counts[provider] = model_counts.get(provider, 0) + 1
+                provider_models.setdefault(provider, []).append(str(model["model_name"]))
+            for provider in providers:
+                provider_id = str(provider["id"])
+                provider["model_count"] = model_counts.get(provider_id, 0)
+                provider["models"] = provider_models.get(provider_id, [])
+            return providers
+
+    def get_provider(self, provider_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._copy(self._find_provider_locked(provider_id))
+
+    def list_models(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        with self._lock:
+            return self._enabled_models_locked() if enabled_only else self._copy(self.models)
+
+    def get_model(self, model_name: str) -> dict[str, Any]:
+        with self._lock:
+            return self._copy(self._find_model_locked(model_name))
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            enabled_models = self._enabled_models_locked()
+            return {
+                "active_model": self.active_model,
+                "model_name": self.active_model,
+                "providers": self.list_providers(),
+                "models": self._copy(self.models),
+                "enabled_models": enabled_models,
+                "enabled_model_names": [str(model["model_name"]) for model in enabled_models],
+                "settings_path": str(self.path),
+            }
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active_model": self.active_model,
+            "providers": self._copy(self.providers),
+            "models": self._copy(self.models),
+        }
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.replace(self.path)
+
+    def add_provider(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            _validate_api_key_env_name(payload.get("api_key_env"))
+            provider = self._normalize_provider(payload)
+            if any(item.get("id") == provider["id"] for item in self.providers):
+                raise SettingsConflictError(f"Provider already exists: {provider['id']}")
+            self.providers.append(provider)
+            self._save()
+            return self._copy(provider)
+
+    def fetch_available_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Fetch a provider's model list without changing saved settings."""
+        with self._lock:
+            provider = self._copy(self._find_provider_locked(provider_id))
+        if isinstance(overrides, dict):
+            if "api_key_env" in overrides:
+                _validate_api_key_env_name(overrides.get("api_key_env"))
+            for key in ("name", "api_key_env", "base_url", "api_key"):
+                if overrides.get(key):
+                    provider[key] = str(overrides[key]).strip()
+        return _query_provider_models(provider, timeout=timeout)
+
+    def query_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Alias for :meth:`fetch_available_models`."""
+        return self.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def fetch_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Alias for :meth:`fetch_available_models`."""
+        return self.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def load_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Fetch a provider's models and add newly discovered ones as enabled models."""
+        discovered = self.fetch_available_models(provider_id, overrides, timeout=timeout)
+        with self._lock:
+            provider = self._find_provider_locked(provider_id)
+            existing = {str(model.get("model_name") or ""): model for model in self.models}
+            added: list[dict[str, Any]] = []
+            for choice in discovered:
+                discovered_name = str(choice.get("model_name") or "").strip()
+                model_name = _qualified_model_name(provider["id"], discovered_name)
+                if not model_name or model_name in existing:
+                    continue
+                legacy_model = existing.get(discovered_name)
+                if legacy_model is not None and legacy_model.get("provider") == provider["id"]:
+                    # Upgrade models loaded before names were provider-qualified.
+                    legacy_model["id"] = model_name
+                    legacy_model["model_name"] = model_name
+                    existing.pop(discovered_name)
+                    existing[model_name] = legacy_model
+                    continue
+                model = self._normalize_model(
+                    {
+                        "model_name": model_name,
+                        "name": choice.get("name") or discovered_name or model_name,
+                        "provider": provider["id"],
+                        "enabled": True,
+                    }
+                )
+                self.models.append(model)
+                existing[model_name] = model
+                added.append(self._copy(model))
+            self._ensure_active_model_locked()
+            self._save()
+            snapshot = self.snapshot()
+            provider_entry = next(
+                (item for item in snapshot["providers"] if item.get("id") == provider["id"]), self._copy(provider)
+            )
+            fetched_names = [choice["model_name"] for choice in discovered]
+            snapshot.update(
+                {
+                    "provider": provider_entry,
+                    "discovered_models": self._copy(discovered),
+                    "queried_models": self._copy(discovered),
+                    "fetched_models": fetched_names,
+                    "available_models": fetched_names,
+                    "provider_models": fetched_names,
+                    "remote_models": fetched_names,
+                    "model_names": fetched_names,
+                    "loaded_models": added,
+                    "added_models": self._copy(added),
+                    "message": (
+                        f"Loaded {len(added)} new model(s) from {provider.get('name') or provider['id']}."
+                        if added
+                        else f"No new models to add from {provider.get('name') or provider['id']}."
+                    ),
+                }
+            )
+            return snapshot
+
+    def refresh_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`load_provider_models`."""
+        return self.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def sync_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`load_provider_models`."""
+        return self.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def fetch_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Alias for :meth:`fetch_available_models`."""
+        return self.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def query_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Alias for :meth:`fetch_available_models`."""
+        return self.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def discover_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        """Alias for :meth:`fetch_available_models`."""
+        return self.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def load_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`load_provider_models`."""
+        return self.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def load_models_from_provider(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`load_provider_models`."""
+        return self.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def refresh_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Alias for :meth:`load_provider_models`."""
+        return self.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def update_provider(self, provider_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            provider = self._find_provider_locked(provider_id)
+            if "api_key_env" in payload:
+                _validate_api_key_env_name(payload.get("api_key_env"))
+            if "name" in payload and str(payload.get("name") or "").strip():
+                provider["name"] = str(payload["name"]).strip()
+            if "api_key_env" in payload:
+                provider["api_key_env"] = str(payload.get("api_key_env") or "").strip()
+            if "base_url" in payload:
+                provider["base_url"] = str(payload.get("base_url") or "").strip()
+            if "api_key" in payload:
+                api_key = str(payload.get("api_key") or "")
+                # The edit form deliberately leaves this field blank so that
+                # changing a name or base URL does not erase a stored key.
+                if api_key or bool(payload.get("clear_api_key")):
+                    provider["api_key"] = api_key
+                    provider["has_api_key"] = bool(api_key)
+            if "enabled" in payload:
+                provider["enabled"] = bool(payload.get("enabled"))
+                self._ensure_active_model_locked()
+            self._save()
+            return self._copy(provider)
+
+    def delete_provider(self, provider_id: str) -> dict[str, Any]:
+        with self._lock:
+            provider = self._find_provider_locked(provider_id)
+            self.providers = [item for item in self.providers if item.get("id") != provider["id"]]
+            self.models = [item for item in self.models if item.get("provider") != provider["id"]]
+            self._ensure_active_model_locked()
+            self._save()
+            return self._copy(provider)
+
+    def add_model(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            model = self._normalize_model(payload)
+            if not model["model_name"]:
+                raise ValueError("model_name must not be empty")
+            if any(item.get("model_name") == model["model_name"] for item in self.models):
+                raise SettingsConflictError(f"Model already exists: {model['model_name']}")
+            provider_id = str(model.get("provider") or _provider_from_model(model["model_name"]))
+            if any(item.get("id") == provider_id for item in self.providers):
+                model["provider"] = provider_id
+            else:
+                self._ensure_provider(provider_id)
+                model["provider"] = provider_id
+            self.models.append(model)
+            if not self.active_model:
+                self.active_model = model["model_name"]
+            self._save()
+            return self._copy(model)
+
+    def update_model(self, model_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            model = self._find_model_locked(model_name)
+            if "name" in payload and str(payload.get("name") or "").strip():
+                model["name"] = str(payload["name"]).strip()
+            if "model_class" in payload:
+                model["model_class"] = str(payload.get("model_class") or "").strip()
+            if "provider" in payload and str(payload.get("provider") or "").strip():
+                provider_id = str(payload["provider"]).strip()
+                self._ensure_provider(provider_id)
+                model["provider"] = provider_id
+            if "enabled" in payload:
+                model["enabled"] = bool(payload.get("enabled"))
+                self._ensure_active_model_locked()
+            self._save()
+            return self._copy(model)
+
+    def delete_model(self, model_name: str) -> dict[str, Any]:
+        with self._lock:
+            model = self._find_model_locked(model_name)
+            self.models = [item for item in self.models if item.get("model_name") != model["model_name"]]
+            self._ensure_active_model_locked()
+            self._save()
+            return self._copy(model)
+
+    def set_model_enabled(self, model_name: str, enabled: bool) -> dict[str, Any]:
+        return self.update_model(model_name, {"enabled": bool(enabled)})
+
+    def set_provider_enabled(self, provider_id: str, enabled: bool) -> dict[str, Any]:
+        return self.update_provider(provider_id, {"enabled": bool(enabled)})
+
+    def _ensure_active_model_locked(self) -> None:
+        current = next((model for model in self.models if model.get("model_name") == self.active_model), None)
+        if (
+            current is not None
+            and current.get("enabled", True)
+            and _model_is_enabled_by_provider(current, self.providers)
+        ):
+            return
+        enabled = self._enabled_models_locked()
+        self.active_model = str(enabled[0]["model_name"]) if enabled else ""
+
+    def set_active_model(self, model_name: str) -> dict[str, Any]:
+        with self._lock:
+            model = self._find_model_locked(model_name)
+            if not model.get("enabled", True):
+                raise ValueError(f"Model is disabled: {model['model_name']}")
+            if not _model_is_enabled_by_provider(model, self.providers):
+                raise ValueError(f"Provider is disabled for model: {model['model_name']}")
+            self.active_model = str(model["model_name"])
+            self._save()
+            return self._copy(model)
+
+    def apply_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply a bulk settings document sent by a settings UI."""
+        with self._lock:
+            if isinstance(payload.get("providers"), list):
+                providers: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for item in payload["providers"]:
+                    if not isinstance(item, dict):
+                        continue
+                    provider = self._normalize_provider(item)
+                    if provider["id"] not in seen:
+                        seen.add(provider["id"])
+                        providers.append(provider)
+                self.providers = providers
+            if isinstance(payload.get("models"), list):
+                models: list[dict[str, Any]] = []
+                seen_models: set[str] = set()
+                for item in payload["models"]:
+                    if not isinstance(item, dict):
+                        continue
+                    model = self._normalize_model(item)
+                    if not model["model_name"] or model["model_name"] in seen_models:
+                        continue
+                    provider_id = str(model.get("provider") or _provider_from_model(model["model_name"]))
+                    if provider_id and not any(provider.get("id") == provider_id for provider in self.providers):
+                        self._ensure_provider(provider_id)
+                    model["provider"] = provider_id
+                    seen_models.add(model["model_name"])
+                    models.append(model)
+                self.models = models
+            active_model = payload.get("active_model") or payload.get("model_name")
+            if isinstance(active_model, str) and active_model.strip():
+                self.active_model = active_model.strip()
+            self._ensure_active_model_locked()
+            self._save()
+            return self.snapshot()
 
 
 class ConversationState(str, Enum):
@@ -214,7 +1029,7 @@ _HTML = r"""<!doctype html>
     .conversation-id:hover { color: var(--accent); }
     .conversation-id-row { display: flex; min-width: 0; margin-top: 2px; }
     .conversation-id-row .conversation-id { max-width: 100%; }
-    .conversation-actions { display: flex; align-items: center; gap: 8px; }
+    .conversation-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
     .conversation-actions button { padding: 5px 9px; border-radius: 7px; font-size: 12px; white-space: nowrap; }
     .conversation-bar .status { flex: 0 0 auto; }
     @keyframes pulse { 50% { opacity: 0.25; } }
@@ -1003,14 +1818,165 @@ _HTML = r"""<!doctype html>
       body.activity-expanded main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); }
       body.activity-expanded aside.conversations { display: none; }
     }
+    .header-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .settings-button {
+      display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+      border: 1px solid var(--border); background: var(--panel); color: var(--text);
+      padding: 7px 11px; border-radius: 9px; cursor: pointer; font-weight: 600;
+    }
+    .settings-button:hover { border-color: var(--accent); color: var(--accent); }
+    .settings-button .gear { font-size: 15px; line-height: 1; }
+    .visually-hidden {
+      position: absolute !important; width: 1px !important; height: 1px !important;
+      padding: 0 !important; margin: -1px !important; overflow: hidden !important;
+      clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important;
+    }
+    .model-switcher-control {
+      display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+      color: var(--muted); font-size: 12px; font-weight: 650;
+    }
+    .model-switcher-control .model-switcher-label { white-space: nowrap; }
+    #model-switcher {
+      max-width: min(380px, 38vw); min-width: 130px;
+      border: 1px solid var(--border); border-radius: 8px;
+      background: var(--panel); color: var(--text);
+      padding: 5px 26px 5px 9px; font: inherit; font-size: 12px;
+      text-overflow: ellipsis; cursor: pointer;
+    }
+    #model-switcher:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+    .model-switcher-provider {
+      max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      padding: 3px 8px; border-radius: 999px; background: var(--accent-soft);
+      color: var(--accent); font-size: 11px; font-weight: 650;
+    }
+    .model-switcher-provider[hidden] { display: none; }
+    .modal-backdrop {
+      position: fixed; inset: 0; z-index: 100;
+      display: grid; place-items: center; padding: 20px;
+      background: rgba(10, 15, 24, 0.48); backdrop-filter: blur(3px);
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .settings-modal {
+      width: min(880px, 100%); max-height: min(86vh, 780px);
+      display: flex; flex-direction: column; overflow: hidden;
+      border: 1px solid var(--border); border-radius: 16px;
+      background: var(--panel); color: var(--text);
+      box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    }
+    .settings-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px;
+      padding: 16px 20px; border-bottom: 1px solid var(--border);
+    }
+    .settings-head h2 { margin: 0; font-size: 18px; letter-spacing: -0.01em; }
+    .settings-close {
+      border: 0; background: transparent; color: var(--muted); cursor: pointer;
+      font-size: 24px; line-height: 1; padding: 2px 7px; border-radius: 8px;
+    }
+    .settings-close:hover { color: var(--text); background: var(--bg); }
+    .settings-tabs {
+      display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border);
+      overflow-x: auto;
+    }
+    .settings-tab {
+      border: 0; border-bottom: 2px solid transparent; border-radius: 7px 7px 0 0;
+      background: transparent; color: var(--muted); cursor: pointer;
+      padding: 9px 13px; font-size: 13px; font-weight: 650; white-space: nowrap;
+    }
+    .settings-tab:hover { color: var(--text); background: var(--bg); }
+    .settings-tab.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft); }
+    .settings-content { padding: 18px 20px 24px; overflow-y: auto; min-height: 280px; }
+    .settings-panel[hidden] { display: none; }
+    .settings-panel h3 { margin: 2px 0 10px; font-size: 14px; }
+    .settings-panel p.hint { margin: 0 0 14px; color: var(--muted); font-size: 12px; }
+    .settings-section-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      margin: 18px 0 9px;
+    }
+    .settings-section-head:first-child { margin-top: 0; }
+    .settings-section-head h3 { margin: 0; }
+    .settings-list { display: flex; flex-direction: column; gap: 8px; }
+    .settings-list[hidden] { display: none; }
+    .provider-group { display: flex; flex-direction: column; gap: 7px; }
+    .provider-row { cursor: pointer; }
+    .provider-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; cursor: pointer; }
+    .provider-row-main:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 7px; }
+    .provider-models {
+      display: flex; flex-direction: column; gap: 7px;
+      margin: 0 0 4px 18px; padding: 8px 0 0 14px;
+      border-left: 2px solid var(--border);
+    }
+    .provider-models[hidden] { display: none; }
+    .provider-models-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      color: var(--muted); font-size: 11px; font-weight: 650; padding-left: 2px;
+    }
+    .provider-models-head button { padding: 3px 7px; border-radius: 6px; font-size: 10px; }
+    .provider-model-row { padding: 8px 10px; background: var(--bg); }
+    .provider-models-empty {
+      color: var(--muted); font-size: 11px; padding: 8px 10px;
+      border: 1px dashed var(--border); border-radius: 8px;
+    }
+    .settings-empty {
+      color: var(--muted); font-size: 12px; padding: 12px;
+      border: 1px dashed var(--border); border-radius: 9px;
+    }
+    .settings-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
+      background: color-mix(in srgb, var(--panel) 82%, var(--bg));
+    }
+    .settings-row-main { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+    .settings-row-title { font-weight: 650; font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+    .settings-row-meta { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+    .settings-row-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+    .settings-row-actions button { padding: 4px 8px; border-radius: 7px; font-size: 11px; }
+    .settings-badge {
+      display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px;
+      background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 700;
+    }
+    .settings-badge.off { background: color-mix(in srgb, var(--muted) 14%, transparent); color: var(--muted); }
+    .settings-form {
+      margin-top: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 11px;
+      background: var(--bg); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px;
+    }
+    .settings-form[hidden] { display: none; }
+    .settings-form .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .settings-form .field.full, .settings-form .field-help.full { grid-column: 1 / -1; }
+    .settings-form label { color: var(--muted); font-size: 11px; font-weight: 650; }
+    .settings-form .field-help {
+      margin: 0; color: var(--muted); font-size: 11px; line-height: 1.45;
+    }
+    .settings-form .field-help code {
+      font-size: 10px; padding: 1px 4px; border-radius: 4px;
+      background: color-mix(in srgb, var(--muted) 13%, transparent);
+    }
+    .settings-form input, .settings-form select {
+      width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: 7px;
+      background: var(--panel); color: var(--text); padding: 7px 9px; font: inherit; font-size: 12px;
+    }
+    .settings-form .form-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+    .settings-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+    .settings-note { color: var(--muted); font-size: 12px; line-height: 1.7; }
+    @media (max-width: 720px) {
+      .header-meta #database-path { display: none; }
+      .settings-form { grid-template-columns: 1fr; }
+      #model-switcher { max-width: 38vw; }
+      .settings-row { align-items: flex-start; }
+      .settings-row-actions { flex-wrap: wrap; justify-content: flex-end; }
+    }
   </style>
 </head>
 <body>
   <header>
     <div class="brand"><span class="brand-mark">m</span><span>mini-SWE-agent</span></div>
-    <div class="header-meta">
-      <span id="database-path" title="SQLite conversation database path"></span>
-      <span id="model-label"></span>
+    <div class="header-actions">
+      <div class="header-meta">
+        <span id="database-path" title="SQLite conversation database path"></span>
+        <span id="model-label"></span>
+      </div>
+      <button id="settings-button" class="settings-button" type="button" aria-haspopup="dialog" aria-controls="settings-modal" title="Open settings">
+        <span class="gear" aria-hidden="true">&#9881;</span><span>Settings</span>
+      </button>
     </div>
   </header>
   <main>
@@ -1024,13 +1990,18 @@ _HTML = r"""<!doctype html>
       </div>
     </aside>
     <section>
-      <div class="panel conversation-bar" aria-label="Conversation status">
+      <span class="visually-hidden" id="status" role="status" aria-live="polite">idle</span>
+      <div class="panel conversation-bar" aria-label="Conversation toolbar">
         <div class="conversation-context">
           <span class="conversation-label" id="conversation-label">New conversation</span>
         </div>
         <div class="conversation-actions">
           <button id="activity-open" class="secondary" type="button" aria-controls="activity-panel" title="Open activity timeline">Activity</button>
-          <span class="status" id="status" role="status" aria-live="polite">idle</span>
+          <label class="model-switcher-control" title="Switch the model for this conversation">
+            <span class="model-switcher-label">Model</span>
+            <select id="model-switcher" aria-label="Switch model"></select>
+            <span class="model-switcher-provider" id="model-switcher-provider" title="Provider of the selected model" hidden></span>
+          </label>
         </div>
       </div>
       <div class="feed-wrap">
@@ -1097,6 +2068,146 @@ _HTML = r"""<!doctype html>
       </section>
     </aside>
   </main>
+  <div id="settings-modal" class="modal-backdrop" hidden>
+    <div class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="settings-head">
+        <div>
+          <h2 id="settings-title">Settings</h2>
+          <div class="settings-row-meta">Configure model providers, enabled models, and GUI preferences.</div>
+        </div>
+        <button id="settings-close" class="settings-close" type="button" aria-label="Close settings">&times;</button>
+      </div>
+      <div class="settings-tabs" role="tablist" aria-label="Settings modules">
+        <button id="settings-tab-general" class="settings-tab active" type="button" role="tab" aria-selected="true" aria-controls="settings-general" data-settings-tab="general">General</button>
+        <button id="settings-tab-models" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-models" data-settings-tab="models">Models</button>
+        <button id="settings-tab-conversation" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-conversation" data-settings-tab="conversation">Conversation</button>
+        <button id="settings-tab-about" class="settings-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-about" data-settings-tab="about">About</button>
+      </div>
+      <div class="settings-content">
+        <section id="settings-general" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-general" data-settings-panel="general">
+          <h3>General</h3>
+          <p class="hint">These values come from the configuration used to launch <code>mini-gui</code>.</p>
+          <div class="settings-list">
+            <div class="settings-row">
+              <div class="settings-row-main">
+                <span class="settings-row-title">Active model</span>
+                <span class="settings-row-meta">The model used for new conversations and follow-up turns.</span>
+              </div>
+              <span class="settings-badge" id="settings-active-model">Not configured</span>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-main">
+                <span class="settings-row-title">Workspace</span>
+                <span class="settings-row-meta" id="settings-workspace">-</span>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-main">
+                <span class="settings-row-title">Conversation database</span>
+                <span class="settings-row-meta" id="settings-database">-</span>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section id="settings-models" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-models" data-settings-panel="models" hidden>
+          <div class="settings-section-head">
+            <div>
+              <h3>Model providers</h3>
+              <p class="hint">Providers describe where model requests are sent and which API key they use. Click a provider to show its models. Use <strong>Load models</strong> to query a saved provider and add the models it returns.</p>
+            </div>
+            <button id="add-provider" class="secondary" type="button">Add provider</button>
+          </div>
+          <div id="providers-list" class="settings-list" aria-label="Model providers"></div>
+          <form id="provider-form" class="settings-form" hidden>
+            <input id="provider-edit-id" type="hidden">
+            <p class="field-help full" id="provider-api-key-location-help">
+              <strong>Where should I put my API key?</strong> Paste the key itself into the
+              <strong>API key (optional, stored locally)</strong> field below. The
+              <strong>API key environment variable</strong> field is only the <em>name</em> of a
+              shell variable (for example, <code>OPENAI_API_KEY</code>), never the key itself.
+            </p>
+            <div class="field">
+              <label for="provider-name">Provider name</label>
+              <input id="provider-name" name="name" type="text" placeholder="OpenAI" autocomplete="off" required>
+            </div>
+            <div class="field">
+              <label for="provider-id">Provider ID</label>
+              <input id="provider-id" name="id" type="text" placeholder="openai" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="provider-api-key-env">API key environment variable (variable name)</label>
+              <input id="provider-api-key-env" name="api_key_env" type="text" placeholder="OPENAI_API_KEY" autocomplete="off" aria-describedby="provider-api-key-env-help">
+              <span class="field-help" id="provider-api-key-env-help">The name of the environment variable that contains your key, such as <code>OPENAI_API_KEY</code>. Do not paste the secret key here.</span>
+            </div>
+            <div class="field">
+              <label for="provider-base-url">Base URL (optional)</label>
+              <input id="provider-base-url" name="base_url" type="url" placeholder="https://api.example.com/v1" autocomplete="off">
+            </div>
+            <div class="field full">
+              <label for="provider-api-key">API key (optional, stored locally)</label>
+              <input id="provider-api-key" name="api_key" type="password" placeholder="Paste your API key here" autocomplete="new-password" aria-describedby="provider-api-key-help">
+              <span class="field-help" id="provider-api-key-help">Paste your API key here to store it locally in the GUI settings. If you already exported it as the environment variable above, you can leave this blank.</span>
+            </div>
+            <div class="form-actions">
+              <button id="provider-cancel" class="secondary" type="button">Cancel</button>
+              <button id="provider-fetch-models" class="secondary" type="button"
+                title="Query models from this provider and load them into the conversation model selector"
+                aria-label="Query models and load them">Fetch &amp; load models</button>
+              <button type="submit">Save provider</button>
+            </div>
+          </form>
+          <div class="settings-section-head">
+            <div>
+              <h3>Models</h3>
+              <p class="hint">Models are grouped under their provider. Expand a provider above to enable, edit, delete, or add models for it.</p>
+            </div>
+            <button id="add-model" class="secondary" type="button">Add model</button>
+          </div>
+          <div id="models-list" class="settings-list" aria-label="Models" hidden></div>
+          <form id="model-form" class="settings-form" hidden>
+            <input id="model-edit-id" type="hidden">
+            <div class="field">
+              <label for="model-name">Model name</label>
+              <input id="model-name" name="model_name" type="text" placeholder="openai/gpt-5.4-mini" autocomplete="off" required>
+            </div>
+            <div class="field">
+              <label for="model-provider">Provider</label>
+              <select id="model-provider" name="provider"></select>
+            </div>
+            <div class="field">
+              <label for="model-display-name">Display name (optional)</label>
+              <input id="model-display-name" name="name" type="text" placeholder="GPT-5.4 mini" autocomplete="off">
+            </div>
+            <div class="field">
+              <label for="model-class">Model class (optional)</label>
+              <input id="model-class" name="model_class" type="text" placeholder="litellm" autocomplete="off">
+            </div>
+            <div class="form-actions">
+              <button id="model-cancel" class="secondary" type="button">Cancel</button>
+              <button type="submit">Save model</button>
+            </div>
+          </form>
+        </section>
+        <section id="settings-conversation" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-conversation" data-settings-panel="conversation" hidden>
+          <h3>Conversation</h3>
+          <p class="settings-note">The conversation header shows the active model selector. Use it to switch models without opening Settings; the selected model is used for the next run in the conversation.</p>
+          <div class="settings-list">
+            <div class="settings-row">
+              <div class="settings-row-main">
+                <span class="settings-row-title">Status display</span>
+                <span class="settings-row-meta">Run status remains visible in the Run panel and in the conversation list.</span>
+              </div>
+              <span class="settings-badge">Model switcher</span>
+            </div>
+          </div>
+        </section>
+        <section id="settings-about" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-about" data-settings-panel="about" hidden>
+          <h3>About mini-SWE-agent</h3>
+          <p class="settings-note">A lightweight browser GUI for inspecting and steering mini-SWE-agent conversations. Settings are stored locally beside the conversation database.</p>
+        </section>
+      </div>
+    </div>
+  </div>
   <script>
     const feed = document.getElementById("feed");
     const empty = document.getElementById("empty");
@@ -1130,6 +2241,24 @@ _HTML = r"""<!doctype html>
     const newConversationButton = document.getElementById("new-conversation");
     const scrollTopButton = document.getElementById("scroll-top");
     const scrollBottomButton = document.getElementById("scroll-bottom");
+    const modelSwitcher = document.getElementById("model-switcher");
+    const modelProviderBadge = document.getElementById("model-switcher-provider");
+    const modelLabel = document.getElementById("model-label");
+    const settingsButton = document.getElementById("settings-button");
+    const settingsModal = document.getElementById("settings-modal");
+    const settingsCloseButton = document.getElementById("settings-close");
+    const settingsTabs = Array.from(document.querySelectorAll(".settings-tab"));
+    const settingsPanels = Array.from(document.querySelectorAll(".settings-panel"));
+    const providersList = document.getElementById("providers-list");
+    const modelsList = document.getElementById("models-list");
+    const providerForm = document.getElementById("provider-form");
+    const modelForm = document.getElementById("model-form");
+    const addProviderButton = document.getElementById("add-provider");
+    const addModelButton = document.getElementById("add-model");
+    const providerCancelButton = document.getElementById("provider-cancel");
+    const providerFetchModelsButton = document.getElementById("provider-fetch-models");
+    const modelCancelButton = document.getElementById("model-cancel");
+    const modelProviderSelect = document.getElementById("model-provider");
     const SCROLL_THRESHOLD = 32;
     const MAX_RECENT_ACTIVITIES = 6;
     const SESSION_STORAGE_KEY = "mini-swe-agent-session";
@@ -1145,6 +2274,11 @@ _HTML = r"""<!doctype html>
     const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
     let followOutput = true;
     let currentTokenUsage = { prompt: 0, completion: 0, total: 0 };
+    let guiSettings = { providers: [], models: [], enabled_models: [], active_model: "" };
+    let currentSettingsTab = "general";
+    let editingProviderId = "";
+    let editingModelId = "";
+    const expandedProviderIds = new Set();
     // Completed assistant messages are kept here until the immediately following
     // events have been inspected.  If one of those events is a tool call for the
     // same command, the command is removed from the assistant text so that the
@@ -1244,6 +2378,590 @@ _HTML = r"""<!doctype html>
       statusEl.textContent = text;
       statusEl.className = "status " + state;
       statStatus.textContent = text;
+    }
+
+    async function apiRequest(url, options = {}) {
+      const response = await fetch(url, options);
+      let data = {};
+      try { data = await response.json(); } catch (err) { data = {}; }
+      if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+      return data;
+    }
+
+    function modelNameOf(model) {
+      return String((model && (model.model_name || model.id)) || "");
+    }
+
+    function modelDisplayName(model) {
+      const name = String((model && model.name) || "");
+      const modelName = modelNameOf(model);
+      if (!name || name === modelName) return modelName;
+      return name + " \u00b7 " + modelName;
+    }
+
+    function modelProviderName(model) {
+      const provider = String((model && model.provider) || "");
+      return provider ? providerName(provider) : "";
+    }
+
+    function modelOptionLabel(model) {
+      const label = modelDisplayName(model);
+      const provider = modelProviderName(model);
+      return provider ? label + " \u2014 " + provider : label;
+    }
+
+    function enabledModels() {
+      if (Array.isArray(guiSettings.enabled_models) && guiSettings.enabled_models.length) {
+        return guiSettings.enabled_models;
+      }
+      return (guiSettings.models || []).filter((model) => model.enabled !== false);
+    }
+
+    function renderModelSwitcher(preferred) {
+      const previous = preferred !== undefined ? String(preferred || "") : String(modelSwitcher.value || "");
+      const enabled = enabledModels().slice();
+      const known = new Set(enabled.map(modelNameOf));
+      if (previous && !known.has(previous)) {
+        const knownModel = (guiSettings.models || []).find((model) => modelNameOf(model) === previous);
+        enabled.unshift(knownModel || { model_name: previous, name: previous, enabled: true });
+        known.add(previous);
+      }
+      modelSwitcher.textContent = "";
+      if (!enabled.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "No model configured";
+        option.disabled = true;
+        modelSwitcher.appendChild(option);
+        modelSwitcher.value = "";
+        modelProviderBadge.textContent = "";
+        modelProviderBadge.hidden = true;
+        modelLabel.textContent = "default model";
+        return;
+      }
+      for (const model of enabled) {
+        const modelName = modelNameOf(model);
+        if (!modelName) continue;
+        const option = document.createElement("option");
+        option.value = modelName;
+        option.textContent = modelOptionLabel(model);
+        modelSwitcher.appendChild(option);
+      }
+      const active = String(guiSettings.active_model || "");
+      const selected = previous && known.has(previous) ? previous : (known.has(active) ? active : modelNameOf(enabled[0]));
+      modelSwitcher.value = selected;
+      const selectedModel = enabled.find((model) => modelNameOf(model) === selected) || enabled[0];
+      modelLabel.textContent = modelOptionLabel(selectedModel) || selected;
+      const selectedProvider = modelProviderName(selectedModel);
+      modelProviderBadge.textContent = selectedProvider;
+      modelProviderBadge.hidden = !selectedProvider;
+    }
+
+    function renderProviderOptions(selected) {
+      const current = String(selected || "");
+      modelProviderSelect.textContent = "";
+      const providers = guiSettings.providers || [];
+      if (!providers.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "No providers yet";
+        modelProviderSelect.appendChild(option);
+        return;
+      }
+      for (const provider of providers) {
+        const option = document.createElement("option");
+        option.value = provider.id;
+        option.textContent = provider.name + (provider.enabled === false ? " (disabled)" : "");
+        modelProviderSelect.appendChild(option);
+      }
+      if (current) modelProviderSelect.value = current;
+    }
+
+    function providerName(providerId) {
+      const provider = (guiSettings.providers || []).find((item) => item.id === providerId);
+      return provider ? provider.name : providerId;
+    }
+
+    function showProviderForm(provider) {
+      editingProviderId = provider ? String(provider.id || "") : "";
+      providerForm.hidden = false;
+      document.getElementById("provider-edit-id").value = editingProviderId;
+      document.getElementById("provider-id").value = editingProviderId;
+      document.getElementById("provider-id").disabled = Boolean(provider);
+      document.getElementById("provider-name").value = provider ? String(provider.name || "") : "";
+      document.getElementById("provider-api-key-env").value = provider ? String(provider.api_key_env || "") : "";
+      document.getElementById("provider-base-url").value = provider ? String(provider.base_url || "") : "";
+      const apiKey = document.getElementById("provider-api-key");
+      apiKey.value = "";
+      apiKey.placeholder = provider && provider.has_api_key ? "Leave blank to keep the existing key" : "Paste your API key here";
+      document.getElementById("provider-name").focus();
+    }
+
+    function hideProviderForm() {
+      editingProviderId = "";
+      providerForm.hidden = true;
+      providerForm.reset();
+      document.getElementById("provider-id").disabled = false;
+    }
+
+    function showModelForm(model, providerId = "") {
+      if (!(guiSettings.providers || []).length) {
+        window.alert("Add a provider first.");
+        return;
+      }
+      editingModelId = model ? modelNameOf(model) : "";
+      const modelNameInput = document.getElementById("model-name");
+      modelForm.hidden = false;
+      document.getElementById("model-edit-id").value = editingModelId;
+      modelNameInput.value = editingModelId;
+      modelNameInput.disabled = Boolean(model);
+      document.getElementById("model-display-name").value = model ? String(model.name || "") : "";
+      document.getElementById("model-class").value = model ? String(model.model_class || "") : "";
+      const selectedProvider = model
+        ? String(model.provider || "")
+        : String(providerId || (guiSettings.providers[0] || {}).id || "");
+      renderProviderOptions(selectedProvider);
+      modelNameInput.focus();
+    }
+
+    function hideModelForm() {
+      editingModelId = "";
+      modelForm.hidden = true;
+      modelForm.reset();
+      document.getElementById("model-name").disabled = false;
+    }
+
+    function renderProviderModelRow(model) {
+      const modelName = modelNameOf(model);
+      const row = document.createElement("div");
+      row.className = "settings-row model-row provider-model-row";
+      row.dataset.modelName = modelName;
+      const main = document.createElement("div");
+      main.className = "settings-row-main";
+      const title = document.createElement("span");
+      title.className = "settings-row-title";
+      title.textContent = String(model.name || modelName);
+      const meta = document.createElement("span");
+      meta.className = "settings-row-meta";
+      const bits = [modelName];
+      if (model.model_class) bits.push(String(model.model_class));
+      meta.textContent = bits.join(" \u00b7 ");
+      main.appendChild(title);
+      main.appendChild(meta);
+      const actions = document.createElement("div");
+      actions.className = "settings-row-actions";
+      const toggleLabel = document.createElement("label");
+      toggleLabel.className = "settings-toggle";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.className = "model-enabled-toggle";
+      toggle.checked = model.enabled !== false;
+      toggle.addEventListener("change", () => toggleModel(modelName, toggle.checked));
+      toggleLabel.appendChild(toggle);
+      toggleLabel.appendChild(document.createTextNode(" Enabled"));
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "secondary";
+      edit.textContent = "Edit";
+      edit.addEventListener("click", () => showModelForm(model, String(model.provider || "")));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "danger";
+      remove.textContent = "Delete";
+      remove.addEventListener("click", () => deleteModel(modelName));
+      actions.appendChild(toggleLabel);
+      actions.appendChild(edit);
+      actions.appendChild(remove);
+      row.appendChild(main);
+      row.appendChild(actions);
+      return row;
+    }
+
+    function toggleProviderModels(providerId) {
+      const key = String(providerId || "");
+      if (!key) return;
+      if (expandedProviderIds.has(key)) expandedProviderIds.delete(key);
+      else expandedProviderIds.add(key);
+      renderSettings();
+    }
+
+    function renderSettings() {
+      const activeModel = String(guiSettings.active_model || "");
+      document.getElementById("settings-active-model").textContent = activeModel || "Not configured";
+      document.getElementById("settings-workspace").textContent = defaultWorkspace || "-";
+      const databaseText = document.getElementById("database-path").textContent || "-";
+      document.getElementById("settings-database").textContent = databaseText;
+
+      providersList.textContent = "";
+      const providers = guiSettings.providers || [];
+      const models = guiSettings.models || [];
+      if (!providers.length) {
+        const emptyState = document.createElement("div");
+        emptyState.className = "settings-empty";
+        emptyState.textContent = "No providers yet. Add one to manage model endpoints and API keys.";
+        providersList.appendChild(emptyState);
+      }
+      for (const provider of providers) {
+        const providerId = String(provider.id || "");
+        const providerModels = models.filter((model) => String(model.provider || "") === providerId);
+        const expanded = expandedProviderIds.has(providerId);
+        const group = document.createElement("div");
+        group.className = "provider-group";
+        group.dataset.providerId = providerId;
+
+        const row = document.createElement("div");
+        row.className = "settings-row provider-row";
+        row.dataset.providerId = providerId;
+        const main = document.createElement("div");
+        main.className = "settings-row-main provider-row-main";
+        main.tabIndex = 0;
+        main.setAttribute("role", "button");
+        main.setAttribute("aria-expanded", expanded ? "true" : "false");
+        main.title = expanded ? "Hide models" : "Show models";
+        const title = document.createElement("span");
+        title.className = "settings-row-title";
+        title.textContent = (expanded ? "\u25be " : "\u25b8 ") + String(provider.name || provider.id || "Provider");
+        const meta = document.createElement("span");
+        meta.className = "settings-row-meta";
+        const bits = [String(provider.id || "")];
+        if (provider.api_key_env) bits.push("env var: " + provider.api_key_env);
+        if (provider.has_api_key) bits.push("API key saved locally");
+        if (provider.base_url) bits.push(provider.base_url);
+        bits.push(providerModels.length + " model(s)");
+        meta.textContent = bits.join(" \u00b7 ");
+        main.appendChild(title);
+        main.appendChild(meta);
+        main.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleProviderModels(providerId);
+          }
+        });
+        const actions = document.createElement("div");
+        actions.className = "settings-row-actions";
+        const badge = document.createElement("span");
+        badge.className = "settings-badge" + (provider.enabled === false ? " off" : "");
+        badge.textContent = provider.enabled === false ? "Disabled" : "Enabled";
+        const edit = document.createElement("button");
+        edit.type = "button";
+        edit.className = "secondary";
+        edit.textContent = "Edit";
+        edit.addEventListener("click", () => showProviderForm(provider));
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "secondary";
+        toggle.textContent = provider.enabled === false ? "Enable" : "Disable";
+        toggle.addEventListener("click", () => toggleProvider(provider));
+        const loadModels = document.createElement("button");
+        loadModels.type = "button";
+        loadModels.className = "secondary provider-load-models";
+        loadModels.textContent = "Load models";
+        loadModels.title = "Query this provider's model list and add the results under this provider";
+        loadModels.dataset.action = "fetch-models";
+        loadModels.addEventListener("click", () => loadProviderModels(provider, loadModels));
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "danger";
+        remove.textContent = "Delete";
+        remove.addEventListener("click", () => deleteProvider(provider));
+        actions.appendChild(badge);
+        actions.appendChild(loadModels);
+        actions.appendChild(edit);
+        actions.appendChild(toggle);
+        actions.appendChild(remove);
+        row.appendChild(main);
+        row.appendChild(actions);
+        row.addEventListener("click", (event) => {
+          if (event.target.closest("button, input, label")) return;
+          toggleProviderModels(providerId);
+        });
+        group.appendChild(row);
+
+        const nested = document.createElement("div");
+        nested.className = "provider-models";
+        nested.dataset.providerId = providerId;
+        nested.hidden = !expanded;
+        const nestedHead = document.createElement("div");
+        nestedHead.className = "provider-models-head";
+        const nestedLabel = document.createElement("span");
+        nestedLabel.textContent = providerModels.length + " model(s)";
+        const addModel = document.createElement("button");
+        addModel.type = "button";
+        addModel.className = "secondary provider-add-model";
+        addModel.textContent = "Add model";
+        addModel.addEventListener("click", () => showModelForm(null, providerId));
+        nestedHead.appendChild(nestedLabel);
+        nestedHead.appendChild(addModel);
+        nested.appendChild(nestedHead);
+        if (!providerModels.length) {
+          const empty = document.createElement("div");
+          empty.className = "provider-models-empty";
+          empty.textContent = "No models under this provider yet.";
+          nested.appendChild(empty);
+        } else {
+          for (const model of providerModels) nested.appendChild(renderProviderModelRow(model));
+        }
+        group.appendChild(nested);
+        providersList.appendChild(group);
+      }
+      renderModelSwitcher();
+    }
+
+    async function loadGuiSettings(options = {}) {
+      try {
+        guiSettings = await apiRequest("/api/settings", { cache: "no-store" });
+        renderSettings();
+        if (options.selectActive) renderModelSwitcher(String(guiSettings.active_model || ""));
+      } catch (err) {
+        console.error("Could not load GUI settings", err);
+      }
+    }
+
+    async function switchModel(modelName) {
+      if (!modelName) return;
+      try {
+        const data = await apiRequest("/api/settings/model", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_name: modelName }),
+        });
+        guiSettings.active_model = data.active_model || modelName;
+        if (!Array.isArray(guiSettings.models)) guiSettings.models = [];
+        renderModelSwitcher(modelName);
+        renderSettings();
+        if (selectedSessionId) {
+          const conversation = conversations.find((item) => conversationId(item) === selectedSessionId);
+          if (conversation) conversation.model_name = modelName;
+        }
+      } catch (err) {
+        window.alert("Could not switch model: " + String(err));
+        await loadGuiSettings();
+      }
+    }
+
+    async function toggleProvider(provider) {
+      try {
+        await apiRequest("/api/providers/" + encodeURIComponent(String(provider.id || "")), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: provider.enabled === false }),
+        });
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not update provider: " + String(err));
+      }
+    }
+
+    async function deleteProvider(provider) {
+      if (!window.confirm("Delete provider \"" + String(provider.name || provider.id) + "\" and its models?")) return;
+      const providerId = String(provider.id || "");
+      try {
+        await apiRequest("/api/providers/" + encodeURIComponent(providerId), { method: "DELETE" });
+        expandedProviderIds.delete(providerId);
+        hideProviderForm();
+        hideModelForm();
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not delete provider: " + String(err));
+      }
+    }
+
+    async function toggleModel(modelName, enabled) {
+      try {
+        await apiRequest("/api/models/" + encodeURIComponent(modelName), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: Boolean(enabled) }),
+        });
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not update model: " + String(err));
+        await loadGuiSettings();
+      }
+    }
+
+    async function deleteModel(modelName) {
+      if (!window.confirm("Delete model \"" + modelName + "\"?")) return;
+      try {
+        await apiRequest("/api/models/" + encodeURIComponent(modelName), { method: "DELETE" });
+        hideModelForm();
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not delete model: " + String(err));
+      }
+    }
+
+    function providerFormPayload() {
+      const envNameInput = document.getElementById("provider-api-key-env");
+      const payload = {
+        id: document.getElementById("provider-id").value.trim(),
+        name: document.getElementById("provider-name").value.trim(),
+        api_key_env: envNameInput.value.trim(),
+        base_url: document.getElementById("provider-base-url").value.trim(),
+        api_key: document.getElementById("provider-api-key").value,
+      };
+      if (!payload.name) return null;
+      if (payload.api_key_env && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(payload.api_key_env)) {
+        window.alert(
+          "The \"API key environment variable\" field expects the name of a variable (for example OPENAI_API_KEY), not your API key. " +
+          "Paste the actual key into the \"API key (optional, stored locally)\" field below."
+        );
+        envNameInput.focus();
+        return null;
+      }
+      return payload;
+    }
+
+    async function persistProviderForm() {
+      const payload = providerFormPayload();
+      if (!payload) return null;
+      if (editingProviderId) {
+        delete payload.id;
+        return await apiRequest("/api/providers/" + encodeURIComponent(editingProviderId), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+      }
+      return await apiRequest("/api/providers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    }
+
+    async function loadProviderModels(provider, button) {
+      const providerId = String((provider && provider.id) || "");
+      if (!providerId) {
+        window.alert("Save the provider before loading its models.");
+        return;
+      }
+      const originalLabel = button ? button.textContent : "";
+      if (button) {
+        button.disabled = true;
+        button.textContent = "Loading...";
+      }
+      try {
+        const data = await apiRequest(
+          "/api/providers/" + encodeURIComponent(providerId) + "/load-models",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          },
+        );
+        guiSettings = data;
+        expandedProviderIds.add(providerId);
+        renderSettings();
+        renderModelSwitcher(String(data.active_model || modelSwitcher.value || ""));
+        const fetched = Array.isArray(data.fetched_models) ? data.fetched_models : [];
+        const loaded = Array.isArray(data.loaded_models) ? data.loaded_models : [];
+        if (loaded.length) {
+          window.alert(
+            "Loaded " + loaded.length + " new model(s). They are enabled and available in the conversation model selector."
+          );
+        } else if (fetched.length) {
+          window.alert("The provider's models are already loaded. They are available in the conversation model selector.");
+        } else {
+          window.alert("The provider returned no models.");
+        }
+      } catch (err) {
+        window.alert("Could not load models: " + String(err));
+        await loadGuiSettings();
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = originalLabel;
+        }
+      }
+    }
+
+    async function fetchProviderModels(provider, button) {
+      // The /fetch-models and /load-models API routes are equivalent aliases.
+      return await loadProviderModels(provider, button);
+    }
+
+    async function saveProviderForm(event) {
+      event.preventDefault();
+      try {
+        const data = await persistProviderForm();
+        if (!data) return;
+        const providerId = String((data.provider || {}).id || "");
+        if (providerId) expandedProviderIds.add(providerId);
+        hideProviderForm();
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not save provider: " + String(err));
+      }
+    }
+
+    async function saveAndLoadProviderModels() {
+      try {
+        const data = await persistProviderForm();
+        if (!data) return;
+        const provider = data.provider || (data.providers || []).find((item) => item.id === editingProviderId);
+        if (!provider || !provider.id) throw new Error("The provider could not be saved.");
+        hideProviderForm();
+        await loadProviderModels(provider, null);
+      } catch (err) {
+        window.alert("Could not save provider: " + String(err));
+      }
+    }
+
+    async function saveModelForm(event) {
+      event.preventDefault();
+      const payload = {
+        model_name: document.getElementById("model-name").value.trim(),
+        name: document.getElementById("model-display-name").value.trim(),
+        provider: document.getElementById("model-provider").value,
+        model_class: document.getElementById("model-class").value.trim(),
+      };
+      if (!payload.model_name) return;
+      try {
+        if (editingModelId) {
+          delete payload.model_name;
+          await apiRequest("/api/models/" + encodeURIComponent(editingModelId), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        } else {
+          await apiRequest("/api/models", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+        }
+        hideModelForm();
+        await loadGuiSettings();
+      } catch (err) {
+        window.alert("Could not save model: " + String(err));
+      }
+    }
+
+    function switchSettingsTab(tabName) {
+      currentSettingsTab = tabName || "general";
+      for (const tab of settingsTabs) {
+        const active = tab.dataset.settingsTab === currentSettingsTab;
+        tab.classList.toggle("active", active);
+        tab.setAttribute("aria-selected", active ? "true" : "false");
+      }
+      for (const panel of settingsPanels) {
+        panel.hidden = panel.dataset.settingsPanel !== currentSettingsTab;
+      }
+    }
+
+    function openSettings(tabName) {
+      settingsModal.hidden = false;
+      switchSettingsTab(tabName || currentSettingsTab);
+      loadGuiSettings();
+      document.getElementById("settings-title").focus();
+    }
+
+    function closeSettings() {
+      settingsModal.hidden = true;
+      hideProviderForm();
+      hideModelForm();
     }
 
     function setComposerRunning(running) {
@@ -2365,6 +4083,11 @@ _HTML = r"""<!doctype html>
       statCost.textContent = "$" + Number((conversation && conversation.cost) || 0).toFixed(4);
       setTokenStatsFromConversation(conversation);
       statExit.textContent = (conversation && conversation.exit_status) || "-";
+      renderModelSwitcher(
+        conversation && conversation.model_name
+          ? conversation.model_name
+          : String(guiSettings.active_model || "")
+      );
       applyConversationStatus(conversation);
     }
 
@@ -2709,6 +4432,7 @@ _HTML = r"""<!doctype html>
       stopButton.disabled = true;
       try {
         const payload = { task, images };
+        if (modelSwitcher.value) payload.model_name = modelSwitcher.value;
         if (continuing) payload.session_id = selectedSessionId;
         const response = await fetch("/api/run", {
           method: "POST",
@@ -2799,6 +4523,7 @@ _HTML = r"""<!doctype html>
       currentTokenUsage = { prompt: 0, completion: 0, total: 0 };
       setTokenStats(0, 0, 0);
       statExit.textContent = "-";
+      renderModelSwitcher(String(guiSettings.active_model || ""));
       setStatus("idle", "");
       setComposerRunning(false);
       taskEl.value = "";
@@ -2837,6 +4562,25 @@ _HTML = r"""<!doctype html>
     sendButton.addEventListener("click", startRun);
     stopButton.addEventListener("click", stopRun);
     newConversationButton.addEventListener("click", startNewConversation);
+    modelSwitcher.addEventListener("change", () => switchModel(modelSwitcher.value));
+    settingsButton.addEventListener("click", () => openSettings("general"));
+    settingsCloseButton.addEventListener("click", closeSettings);
+    settingsModal.addEventListener("click", (event) => {
+      if (event.target === settingsModal) closeSettings();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !settingsModal.hidden) closeSettings();
+    });
+    for (const tab of settingsTabs) {
+      tab.addEventListener("click", () => switchSettingsTab(tab.dataset.settingsTab));
+    }
+    addProviderButton.addEventListener("click", () => showProviderForm(null));
+    providerCancelButton.addEventListener("click", hideProviderForm);
+    providerFetchModelsButton.addEventListener("click", saveAndLoadProviderModels);
+    providerForm.addEventListener("submit", saveProviderForm);
+    addModelButton.addEventListener("click", () => showModelForm(null, Array.from(expandedProviderIds)[0] || ""));
+    modelCancelButton.addEventListener("click", hideModelForm);
+    modelForm.addEventListener("submit", saveModelForm);
     taskEl.addEventListener("input", resizeTaskInput);
     taskEl.addEventListener("keydown", (event) => {
       if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) startRun();
@@ -2868,7 +4612,10 @@ _HTML = r"""<!doctype html>
       }
     }
 
-    restoreConversation();
+    loadGuiSettings({ selectActive: true }).then(() => {
+      if (!selectedSessionId) renderModelSwitcher(String(guiSettings.active_model || ""));
+      restoreConversation();
+    });
     setInterval(() => loadConversations(), 5000);
     window.addEventListener("hashchange", () => {
       const sessionId = rememberedSessionId();
@@ -2953,6 +4700,21 @@ def _json_safe(value: Any) -> Any:
     return json.loads(json.dumps(value, default=str))
 
 
+def _callable_accepts_keyword(func: Callable[..., Any], name: str) -> bool:
+    """Return whether *func* can be called with a keyword argument named *name*.
+
+    Test doubles and builtins sometimes do not expose a Python signature.  In
+    that case optimistically try the keyword: the richer call is what real
+    agents support, and a genuinely incompatible callable still raises and is
+    reported through the normal GUI error path.
+    """
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(p.name == name or p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters)
+
+
 class GuiSession:
     """One browser-triggered agent run and its replayable event stream."""
 
@@ -2963,6 +4725,7 @@ class GuiSession:
         task: str,
         *,
         config: GuiConfig,
+        model_name: str = "",
         images: list[str] | None = None,
         agent_factory: Callable[[], Any] | None = None,
         store: ConversationStore | None = None,
@@ -2976,6 +4739,7 @@ class GuiSession:
         self.current_task = task
         self.current_images = list(images or [])
         self.config = config
+        self.model_name = str(model_name or config.model_name or "").strip()
         self.workspace = config.workspace
         self.agent_factory = agent_factory or (lambda: create_agent_from_config(config))
         self.events: list[dict[str, Any]] = []
@@ -2992,6 +4756,10 @@ class GuiSession:
         self.token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.error = ""
         self.trajectory: dict[str, Any] | None = None
+        # Cumulative message history for this conversation.  It is seeded into
+        # each fresh agent on a follow-up turn so the model keeps the context of
+        # all earlier user instructions, tool calls, and observations.
+        self.messages: list[dict[str, Any]] = []
         self._store = store
         self.thread = threading.Thread(target=self._run, name=f"mini-gui-{self.session_id[:8]}", daemon=True)
 
@@ -3012,6 +4780,13 @@ class GuiSession:
             next((event.get("images") for event in events if event.get("type") == "run_start"), []) or []
         )
         session.config = config
+        run_start_events = [event for event in events if event.get("type") == "run_start"]
+        session.model_name = str(
+            summary.get("model_name")
+            or (run_start_events[-1].get("model_name") if run_start_events else "")
+            or config.model_name
+            or ""
+        ).strip()
         session.workspace = str(summary.get("workspace") or config.workspace)
         session.agent_factory = None
         session.events = list(events)
@@ -3032,7 +4807,14 @@ class GuiSession:
         }
         session.tokens = session.token_usage["total_tokens"]
         session.error = str(summary.get("error") or "")
-        session.trajectory = None
+        session.trajectory = (
+            store.load_trajectory(session.session_id)
+            if store is not None and hasattr(store, "load_trajectory")
+            else None
+        )
+        session.messages = copy.deepcopy((session.trajectory or {}).get("messages") or [])
+        if not session.messages:
+            session.messages = session._history_from_events()
         session._store = store
         session.thread = None
         if session.done and (not session.events or session.events[-1].get("type") != "done"):
@@ -3058,6 +4840,12 @@ class GuiSession:
 
     def start(self) -> None:
         self.thread.start()
+
+    def set_model(self, model_name: str, agent_factory: Callable[[], Any] | None = None) -> None:
+        """Select the model used by subsequent turns in this conversation."""
+        self.model_name = str(model_name or "").strip()
+        if agent_factory is not None:
+            self.agent_factory = agent_factory
 
     def request_stop(self) -> bool:
         """Ask the running agent to stop and return whether it was still running."""
@@ -3105,6 +4893,7 @@ class GuiSession:
                     self.condition.wait(remaining)
             self.current_task = task
             self.current_images = images
+            self._ensure_previous_instructions()
             self.done = False
             self._done_emitted = False
             self.stop_requested.clear()
@@ -3116,6 +4905,66 @@ class GuiSession:
         self._persist_summary()
         self.thread.start()
         return event_offset
+
+    def _history_from_events(self) -> list[dict[str, Any]]:
+        """Build a minimal transcript for agents that do not expose messages.
+
+        Built-in agents keep the exact protocol messages in ``agent.messages``
+        and take precedence over this fallback.  Custom agents and conversations
+        restored from older databases may not have that data available, so we
+        reconstruct the user instructions and visible assistant answers from
+        the persisted event stream.  Passing this transcript to the next turn
+        is still far better than silently starting a brand-new conversation.
+        """
+        with self.condition:
+            events = list(self.events)
+        messages: list[dict[str, Any]] = []
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "run_start":
+                task = str(event.get("task") or "").strip()
+                if task:
+                    messages.append({"role": "user", "content": task})
+            elif event_type == "assistant_message":
+                content = str(event.get("content") or "").strip()
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+        return messages
+
+    def _ensure_previous_instructions(self) -> None:
+        """Seed older user turns that are missing from a restored trajectory.
+
+        Conversations created before follow-ups preserved history only stored
+        the latest agent trajectory, even though the event stream still records
+        every ``run_start`` task.  When such a conversation is continued, add a
+        compact list of the earlier instructions so the model does not treat the
+        new message as an isolated, new conversation.
+        """
+        with self.condition:
+            events = list(self.events)
+            messages = self.messages
+        instructions: list[str] = []
+        for event in events:
+            if event.get("type") != "run_start":
+                continue
+            task = str(event.get("task") or "").strip()
+            if task and task not in instructions:
+                instructions.append(task)
+        if not instructions:
+            return
+        user_text = "\n".join(
+            str(message.get("content") or "") for message in messages if message.get("role") == "user"
+        )
+        missing = [instruction for instruction in instructions if instruction not in user_text]
+        if not missing:
+            return
+        context = (
+            "Earlier instructions in this same conversation (use them as "
+            "context; the latest user message below is the current request):\n"
+            + "\n".join(f"- {instruction}" for instruction in missing)
+        )
+        insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+        messages.insert(insert_at, {"role": "user", "content": context})
 
     def _set_token_usage(self, prompt: Any = 0, completion: Any = 0, total: Any = 0) -> None:
         prompt_tokens = int(prompt or 0)
@@ -3136,6 +4985,7 @@ class GuiSession:
             "task": self.task,
             "image_count": len(self.images),
             "workspace": self.workspace,
+            "model_name": self.model_name,
             "status": status,
             "state": state.value,
             "created_at": self.created_at,
@@ -3263,6 +5113,7 @@ class GuiSession:
                         "type": "run_start",
                         "task": self.current_task,
                         "images": list(self.current_images),
+                        "model_name": self.model_name,
                         "step_limit": agent_config.get("step_limit", 0),
                         "cost_limit": agent_config.get("cost_limit", 0.0),
                     }
@@ -3301,6 +5152,12 @@ class GuiSession:
                     }
                 )
                 return
+            # A follow-up starts with a fresh model/environment so model
+            # switches and per-turn limits work, but it must carry the complete
+            # transcript from all previous turns.  Without this, each user
+            # instruction was sent to the model as if it were a brand-new
+            # conversation and appeared to overwrite the previous one.
+            history = copy.deepcopy(self.messages)
             agent = self.agent_factory()
             self.agent = agent
             if hasattr(agent, "set_event_callback"):
@@ -3311,20 +5168,35 @@ class GuiSession:
                 elif hasattr(agent, "stop"):
                     agent.stop()
             run_kwargs: dict[str, Any] = {}
-            if self.current_images:
-                try:
-                    parameters = inspect.signature(agent.run).parameters.values()
-                    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters) or any(
-                        p.name == "images" for p in parameters
-                    ):
-                        run_kwargs["images"] = self.current_images
-                except (TypeError, ValueError):
-                    # Builtins and mocks may not expose a signature; try the
-                    # richer call and let the exception path report failures.
+            continue_method = getattr(agent, "continue_run", None) if history else None
+            if callable(continue_method):
+                if history and _callable_accepts_keyword(continue_method, "messages"):
+                    run_kwargs["messages"] = history
+                if self.current_images and _callable_accepts_keyword(continue_method, "images"):
                     run_kwargs["images"] = self.current_images
-            returned = agent.run(self.current_task, **run_kwargs)
+                returned = continue_method(self.current_task, **run_kwargs)
+            else:
+                run_method = getattr(agent, "run", None)
+                if run_method is None:
+                    raise TypeError(f"{type(agent).__name__} has no run() method")
+                # Custom agents can opt into conversation history by accepting
+                # a messages/history keyword on run().  Built-in DefaultAgent
+                # uses continue_run() instead.
+                if history:
+                    for history_kwarg in ("messages", "history", "message_history"):
+                        if _callable_accepts_keyword(run_method, history_kwarg):
+                            run_kwargs[history_kwarg] = history
+                            break
+                if self.current_images and _callable_accepts_keyword(run_method, "images"):
+                    run_kwargs["images"] = self.current_images
+                returned = run_method(self.current_task, **run_kwargs)
             if isinstance(returned, dict):
                 result = {**result, **returned}
+            agent_messages = getattr(agent, "messages", None)
+            if isinstance(agent_messages, list) and agent_messages:
+                self.messages = copy.deepcopy(agent_messages)
+            else:
+                self.messages = self._history_from_events()
         except UserInterruption:
             # Some custom agents may propagate the stop signal rather than
             # converting it into an exit message. Treat it as a clean user stop
@@ -3341,6 +5213,12 @@ class GuiSession:
             )
             logger.exception("GUI agent run failed")
         finally:
+            agent = self.agent
+            agent_messages = getattr(agent, "messages", None)
+            if isinstance(agent_messages, list) and agent_messages:
+                self.messages = copy.deepcopy(agent_messages)
+            else:
+                self.messages = self._history_from_events()
             if not self._done_emitted:
                 self.emit({"type": "done", **result})
             with self.condition:
@@ -3372,15 +5250,273 @@ class GuiSessionManager:
         db_path: str | Path | None = None,
         database_path: str | Path | None = None,
         store: ConversationStore | None = None,
+        settings_path: str | Path | None = None,
     ):
         self.config = config
         self.agent_factory = agent_factory
-        self.store = store or ConversationStore(
-            db_path or database_path or os.getenv("MSWEA_GUI_DB_PATH") or DEFAULT_DATABASE_FILE
+        resolved_db_path = db_path or database_path or os.getenv("MSWEA_GUI_DB_PATH") or DEFAULT_DATABASE_FILE
+        self.store = store or ConversationStore(resolved_db_path)
+        resolved_settings_path = settings_path or self._default_settings_path(
+            resolved_db_path, database_path=database_path, store=store
         )
+        model_config = config.agent_config.get("model", {}) if isinstance(config.agent_config, dict) else {}
+        self.model_settings = GuiModelSettings(
+            resolved_settings_path,
+            default_model=config.model_name,
+            default_model_class=str(model_config.get("model_class") or ""),
+        )
+        # Short alias used by templates and integrations.
+        self.settings = self.model_settings
         self.sessions: dict[str, GuiSession] = {}
         self._lock = threading.Lock()
         self._restore_sessions()
+
+    @staticmethod
+    def _default_settings_path(
+        db_path: str | Path,
+        *,
+        database_path: str | Path | None = None,
+        store: ConversationStore | None = None,
+    ) -> Path:
+        """Keep GUI settings beside an explicitly selected conversation DB.
+
+        This keeps test databases and multiple GUI profiles isolated while the
+        normal ``gui_conversations.db`` still resolves to the global config
+        directory. ``MSWEA_GUI_SETTINGS_PATH`` always takes precedence.
+        """
+        configured = os.getenv("MSWEA_GUI_SETTINGS_PATH")
+        if configured:
+            return Path(configured).expanduser()
+        candidate = db_path or database_path or (store.path if store is not None else "")
+        if candidate and str(candidate) != ":memory:":
+            return Path(str(candidate)).expanduser().with_name("gui_settings.json")
+        return DEFAULT_SETTINGS_FILE
+
+    @property
+    def active_model_name(self) -> str:
+        """Return the model selected in the GUI settings."""
+        return str(getattr(self.model_settings, "active_model", "") or "")
+
+    def model_settings_snapshot(self) -> dict[str, Any]:
+        """Return provider/model state for both the API and the switcher."""
+        payload = self.model_settings.snapshot()
+        payload["active_model"] = self.active_model_name
+        payload["model_name"] = self.active_model_name
+        return payload
+
+    def get_settings(self) -> dict[str, Any]:
+        """Alias for :meth:`model_settings_snapshot`."""
+        return self.model_settings_snapshot()
+
+    def list_enabled_models(self) -> list[dict[str, Any]]:
+        return self.model_settings.list_models(enabled_only=True)
+
+    def switch_model(self, model_name: str) -> dict[str, Any]:
+        """Alias for :meth:`set_active_model`."""
+        return self.set_active_model(model_name)
+
+    def _config_for_model(self, model_name: str) -> GuiConfig:
+        if not model_name:
+            return self.config
+        config = self.config if model_name == self.config.model_name else copy.deepcopy(self.config)
+        model_config = config.agent_config.setdefault("model", {})
+        model_config["model_name"] = model_name
+        config.model_name = model_name
+        try:
+            model_entry = self.model_settings.get_model(model_name)
+        except SettingsNotFoundError:
+            return config
+        if model_entry.get("model_class"):
+            model_config["model_class"] = model_entry["model_class"]
+        provider_id = str(model_entry.get("provider") or "")
+        provider = next(
+            (item for item in self.model_settings.providers if item.get("id") == provider_id),
+            None,
+        )
+        if provider is not None:
+            model_class = str(model_entry.get("model_class") or "")
+            if not model_class or "litellm" in model_class.lower():
+                qualified_name = _qualified_model_name(provider_id, model_name)
+                model_config["model_name"] = qualified_name
+                config.model_name = qualified_name
+            model_kwargs = model_config.setdefault("model_kwargs", {})
+            if provider.get("base_url"):
+                model_kwargs.setdefault("api_base", provider["base_url"])
+            if provider.get("api_key"):
+                model_kwargs.setdefault("api_key", provider["api_key"])
+                api_key_env = str(provider.get("api_key_env") or "")
+                if api_key_env and not os.getenv(api_key_env):
+                    # LiteLLM and several provider integrations resolve keys
+                    # from the environment.  GUI-managed keys should behave the
+                    # same way for every model class.
+                    os.environ[api_key_env] = str(provider["api_key"])
+        return config
+
+    def _agent_factory_for_model(self, model_name: str) -> Callable[[], Any] | None:
+        if self.agent_factory is not None:
+            return self.agent_factory
+        config = self._config_for_model(model_name)
+        return lambda: create_agent_from_config(config)
+
+    def _resolve_model_name(self, model_name: str | None) -> str:
+        requested = str(model_name or "").strip()
+        if requested:
+            try:
+                model = self.model_settings.get_model(requested)
+            except SettingsNotFoundError:
+                model = None
+            if model is not None and not model.get("enabled", True):
+                raise ValueError(f"Model is disabled: {requested}")
+            if model is not None and not _model_is_enabled_by_provider(model, self.model_settings.providers):
+                raise ValueError(f"Provider is disabled for model: {requested}")
+            return requested
+        return self.active_model_name
+
+    def list_providers(self) -> list[dict[str, Any]]:
+        return self.model_settings.list_providers()
+
+    def list_models(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        return self.model_settings.list_models(enabled_only=enabled_only)
+
+    def add_provider(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.model_settings.add_provider(payload)
+
+    def fetch_available_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.fetch_available_models(provider_id, overrides, timeout=timeout)
+
+    def query_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.query_provider_models(provider_id, overrides, timeout=timeout)
+
+    def fetch_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.fetch_provider_models(provider_id, overrides, timeout=timeout)
+
+    def load_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.load_provider_models(provider_id, overrides, timeout=timeout)
+
+    def refresh_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.refresh_provider_models(provider_id, overrides, timeout=timeout)
+
+    def sync_provider_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.sync_provider_models(provider_id, overrides, timeout=timeout)
+
+    def fetch_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.fetch_models(provider_id, overrides, timeout=timeout)
+
+    def query_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.query_models(provider_id, overrides, timeout=timeout)
+
+    def discover_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> list[dict[str, str]]:
+        return self.model_settings.discover_models(provider_id, overrides, timeout=timeout)
+
+    def load_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.load_models(provider_id, overrides, timeout=timeout)
+
+    def load_models_from_provider(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.load_models_from_provider(provider_id, overrides, timeout=timeout)
+
+    def refresh_models(
+        self,
+        provider_id: str,
+        overrides: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        return self.model_settings.refresh_models(provider_id, overrides, timeout=timeout)
+
+    def update_provider(self, provider_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.model_settings.update_provider(provider_id, payload)
+
+    def delete_provider(self, provider_id: str) -> dict[str, Any]:
+        return self.model_settings.delete_provider(provider_id)
+
+    def add_model(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.model_settings.add_model(payload)
+
+    def update_model(self, model_name: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.model_settings.update_model(model_name, payload)
+
+    def delete_model(self, model_name: str) -> dict[str, Any]:
+        return self.model_settings.delete_model(model_name)
+
+    def set_model_enabled(self, model_name: str, enabled: bool) -> dict[str, Any]:
+        return self.model_settings.set_model_enabled(model_name, enabled)
+
+    def set_provider_enabled(self, provider_id: str, enabled: bool) -> dict[str, Any]:
+        return self.model_settings.set_provider_enabled(provider_id, enabled)
+
+    def set_active_model(self, model_name: str) -> dict[str, Any]:
+        model = self.model_settings.set_active_model(model_name)
+        # Existing idle conversations can use the new model on their next turn.
+        for session in self.sessions.values():
+            if session.done and not session.model_name:
+                session.set_model(model["model_name"], self._agent_factory_for_model(model["model_name"]))
+        return model
 
     @property
     def database_path(self) -> str:
@@ -3417,20 +5553,29 @@ class GuiSessionManager:
                 summary["exit_status"] = "Interrupted"
                 self.store.save_session(summary)
             session = GuiSession.restore(summary, events, config=self.config, store=self.store)
+            if self.agent_factory is not None:
+                # A custom factory (used by tests and integrations) should also
+                # be available when continuing a conversation restored from
+                # disk.  The default factory is rebuilt lazily by
+                # continue_session() so it can honor a model switch.
+                session.agent_factory = self.agent_factory
             self.sessions[session.session_id] = session
 
-    def start_session(self, task: str, images: list[str] | None = None) -> GuiSession:
+    def start_session(self, task: str, images: list[str] | None = None, model_name: str | None = None) -> GuiSession:
         task = task.strip()
         images = list(images or [])
         if not task and not images:
             raise ValueError("Task must not be empty")
         if not task:
             task = "Please analyze the attached image."
+        selected_model = self._resolve_model_name(model_name)
+        session_config = self._config_for_model(selected_model)
         session = GuiSession(
             task,
-            config=self.config,
+            config=session_config,
+            model_name=selected_model,
             images=images,
-            agent_factory=self.agent_factory,
+            agent_factory=self._agent_factory_for_model(selected_model),
             store=self.store,
         )
         with self._lock:
@@ -3440,12 +5585,26 @@ class GuiSessionManager:
         return session
 
     def continue_session(
-        self, session_id: str, task: str, images: list[str] | None = None
+        self,
+        session_id: str,
+        task: str,
+        images: list[str] | None = None,
+        model_name: str | None = None,
     ) -> tuple[GuiSession, int] | None:
         """Append a follow-up message to an existing conversation."""
         session = self.get_session(session_id)
         if session is None:
             return None
+        selected_model = self._resolve_model_name(model_name) if model_name else session.model_name
+        if selected_model and selected_model != session.model_name:
+            session.config = self._config_for_model(selected_model)
+            session.set_model(selected_model, self._agent_factory_for_model(selected_model))
+        elif session.agent_factory is None:
+            # Sessions restored from SQLite intentionally have no live agent or
+            # factory. Build one for the next turn while preserving the model
+            # recorded with the conversation.
+            session.config = self._config_for_model(selected_model)
+            session.set_model(selected_model, self._agent_factory_for_model(selected_model))
         return session, session.continue_run(task, images=images)
 
     def get_session(self, session_id: str) -> GuiSession | None:
@@ -3538,6 +5697,194 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_settings_snapshot(
+        self, *, status: HTTPStatus = HTTPStatus.OK, extra: dict[str, Any] | None = None
+    ) -> None:
+        payload = self.server.manager.model_settings_snapshot()
+        if extra:
+            payload.update(extra)
+        self._send_json(status, payload)
+
+    @staticmethod
+    def _settings_path_id(path: str, prefixes: tuple[str, ...]) -> tuple[str, str] | None:
+        """Return ``(resource_id, action)`` for a settings sub-path."""
+        clean = path.rstrip("/")
+        action = ""
+        for candidate in ("enable", "disable", "toggle"):
+            suffix = "/" + candidate
+            if clean.endswith(suffix):
+                clean = clean[: -len(suffix)]
+                action = candidate
+                break
+        for prefix in prefixes:
+            if clean.startswith(prefix):
+                resource_id = unquote(clean.removeprefix(prefix).strip("/"))
+                if resource_id:
+                    return resource_id, action
+        return None
+
+    @staticmethod
+    def _provider_models_target(path: str) -> tuple[str, str] | None:
+        """Return ``(provider_id, action)`` for provider model-query endpoints."""
+        clean = path.rstrip("/")
+        suffixes = (
+            ("/models/refresh", "refresh"),
+            ("/models/load", "load"),
+            ("/models/fetch", "fetch"),
+            ("/models/discover", "discover"),
+            ("/fetch-models", "fetch"),
+            ("/load-models", "load"),
+            ("/refresh-models", "refresh"),
+            ("/discover-models", "discover"),
+            ("/query-models", "query"),
+            ("/import-models", "import"),
+            ("/available-models", "available"),
+            ("/model-list", "models"),
+            ("/fetch_models", "fetch"),
+            ("/load_models", "load"),
+            ("/refresh_models", "refresh"),
+            ("/fetch", "fetch"),
+            ("/load", "load"),
+            ("/refresh", "refresh"),
+            ("/query", "query"),
+            ("/models", "models"),
+        )
+        for suffix, action in suffixes:
+            if not clean.endswith(suffix):
+                continue
+            root = clean[: -len(suffix)]
+            for prefix in ("/api/settings/providers/", "/api/providers/"):
+                if root.startswith(prefix):
+                    provider_id = unquote(root.removeprefix(prefix).strip("/"))
+                    if provider_id:
+                        return provider_id, action
+        return None
+
+    def _dispatch_model_settings_write(self, method: str, path: str) -> bool:
+        """Handle provider/model/settings writes shared by POST, PUT and PATCH.
+
+        Returns ``True`` when the request was handled.  Keeping all mutation
+        paths in one place makes the small API easy to extend without adding a
+        web framework dependency.
+        """
+        active_model_paths = {
+            "/api/settings/model",
+            "/api/models/active",
+            "/api/model",
+            "/api/model/switch",
+            "/api/model/select",
+            "/api/models/select",
+            "/api/models/activate",
+            "/api/settings/models/active",
+        }
+        provider_collection_paths = {"/api/providers", "/api/settings/providers"}
+        model_collection_paths = {"/api/models", "/api/settings/models"}
+        provider_prefixes = ("/api/settings/providers/", "/api/providers/")
+        model_prefixes = ("/api/settings/models/", "/api/models/")
+
+        try:
+            provider_models_target = self._provider_models_target(path)
+            if method in ("POST", "PUT", "PATCH") and provider_models_target is not None:
+                provider_id, _ = provider_models_target
+                payload = self._read_json_body() if self.headers.get("Content-Length", "0") not in ("", "0") else {}
+                self._send_json(HTTPStatus.OK, self.server.manager.load_provider_models(provider_id, payload))
+                return True
+            if method == "POST" and path in provider_collection_paths:
+                payload = self._read_json_body()
+                provider = self.server.manager.add_provider(payload)
+                self._send_settings_snapshot(status=HTTPStatus.CREATED, extra={"provider": provider})
+                return True
+            if method == "POST" and path in model_collection_paths:
+                payload = self._read_json_body()
+                model = self.server.manager.add_model(payload)
+                self._send_settings_snapshot(status=HTTPStatus.CREATED, extra={"model": model})
+                return True
+            if method == "POST" and path in active_model_paths:
+                payload = self._read_json_body()
+                model_name = payload.get("model_name") or payload.get("model") or payload.get("active_model")
+                if not isinstance(model_name, str) or not model_name.strip():
+                    raise ValueError("model_name must be a non-empty string")
+                model = self.server.manager.set_active_model(model_name.strip())
+                self._send_settings_snapshot(extra={"model": model, "active_model": model["model_name"]})
+                return True
+            if method in ("PUT", "PATCH") and path.rstrip("/") in ("/api/settings", "/api/settings/model"):
+                payload = self._read_json_body()
+                if path.rstrip("/") == "/api/settings" and (
+                    isinstance(payload.get("providers"), list) or isinstance(payload.get("models"), list)
+                ):
+                    self.server.manager.model_settings.apply_settings(payload)
+                    self._send_settings_snapshot()
+                    return True
+                model_name = payload.get("model_name") or payload.get("model") or payload.get("active_model")
+                if model_name is not None:
+                    if not isinstance(model_name, str) or not model_name.strip():
+                        raise ValueError("model_name must be a non-empty string")
+                    self.server.manager.set_active_model(model_name.strip())
+                self._send_settings_snapshot()
+                return True
+
+            provider_target = self._settings_path_id(path, provider_prefixes)
+            if provider_target is not None:
+                provider_id, action = provider_target
+                if method == "DELETE":
+                    provider = self.server.manager.delete_provider(provider_id)
+                    self._send_settings_snapshot(extra={"deleted_provider": provider})
+                    return True
+                if method in ("PUT", "PATCH") or (method == "POST" and action == ""):
+                    payload = self._read_json_body() if action == "" else {}
+                    if action == "enable":
+                        payload["enabled"] = True
+                    elif action == "disable":
+                        payload["enabled"] = False
+                    provider = self.server.manager.update_provider(provider_id, payload)
+                    self._send_settings_snapshot(extra={"provider": provider})
+                    return True
+                if method == "POST" and action:
+                    if action == "toggle":
+                        provider = self.server.manager.get_provider(provider_id)
+                        enabled = not bool(provider.get("enabled", True))
+                    else:
+                        enabled = action == "enable"
+                    provider = self.server.manager.set_provider_enabled(provider_id, enabled)
+                    self._send_settings_snapshot(extra={"provider": provider})
+                    return True
+
+            model_target = self._settings_path_id(path, model_prefixes)
+            if model_target is not None:
+                model_name, action = model_target
+                if method == "DELETE":
+                    model = self.server.manager.delete_model(model_name)
+                    self._send_settings_snapshot(extra={"deleted_model": model})
+                    return True
+                if method in ("PUT", "PATCH") or (method == "POST" and action == ""):
+                    payload = self._read_json_body() if action == "" else {}
+                    if action == "enable":
+                        payload["enabled"] = True
+                    elif action == "disable":
+                        payload["enabled"] = False
+                    model = self.server.manager.update_model(model_name, payload)
+                    self._send_settings_snapshot(extra={"model": model})
+                    return True
+                if method == "POST" and action:
+                    if action == "toggle":
+                        model = self.server.manager.get_model(model_name)
+                        enabled = not bool(model.get("enabled", True))
+                    else:
+                        enabled = action == "enable"
+                    model = self.server.manager.set_model_enabled(model_name, enabled)
+                    self._send_settings_snapshot(extra={"model": model})
+                    return True
+        except SettingsConflictError as exc:
+            self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
+            return True
+        except SettingsNotFoundError as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+            return True
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return True
+        return False
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
@@ -3545,17 +5892,73 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/health":
             self._send_json(HTTPStatus.OK, {"status": "ok"})
         elif parsed.path == "/api/config":
+            settings_payload = self.server.manager.model_settings_snapshot()
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "initial_task": self.server.manager.config.initial_task,
-                    "model_name": self.server.manager.config.model_name,
+                    "model_name": self.server.manager.active_model_name,
+                    "active_model": self.server.manager.active_model_name,
                     "workspace": self.server.manager.config.workspace,
                     "database_path": self.server.manager.database_path,
                     "db_path": self.server.manager.database_path,
                     "database": self.server.manager.database_info(),
+                    "providers": settings_payload.get("providers", []),
+                    "models": settings_payload.get("models", []),
+                    "enabled_models": settings_payload.get("enabled_models", []),
+                    "enabled_model_names": settings_payload.get("enabled_model_names", []),
+                    "settings": settings_payload,
                 },
             )
+        elif parsed.path in ("/api/settings", "/api/settings/", "/api/providers", "/api/settings/providers"):
+            self._send_settings_snapshot()
+        elif parsed.path in ("/api/models", "/api/settings/models"):
+            payload = self.server.manager.model_settings_snapshot()
+            enabled_values = parse_qs(parsed.query).get("enabled", [])
+            if enabled_values and enabled_values[0].strip().lower() in ("1", "true", "yes", "on"):
+                payload["models"] = payload.get("enabled_models", [])
+            self._send_json(HTTPStatus.OK, payload)
+        elif parsed.path in ("/api/models/enabled", "/api/settings/models/enabled"):
+            payload = self.server.manager.model_settings_snapshot()
+            payload["models"] = payload.get("enabled_models", [])
+            self._send_json(HTTPStatus.OK, payload)
+        elif (provider_models_target := self._provider_models_target(parsed.path)) is not None:
+            provider_id, _ = provider_models_target
+            try:
+                payload = self.server.manager.load_provider_models(provider_id)
+            except SettingsNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            except ValueError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send_json(HTTPStatus.OK, payload)
+        elif parsed.path.startswith(("/api/providers/", "/api/settings/providers/")):
+            prefixes = ("/api/settings/providers/", "/api/providers/")
+            target = self._settings_path_id(parsed.path, prefixes)
+            if target is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown provider"})
+                return
+            provider_id, _ = target
+            try:
+                provider = self.server.manager.model_settings.get_provider(provider_id)
+            except SettingsNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_settings_snapshot(extra={"provider": provider})
+        elif parsed.path.startswith(("/api/models/", "/api/settings/models/")):
+            prefixes = ("/api/settings/models/", "/api/models/")
+            target = self._settings_path_id(parsed.path, prefixes)
+            if target is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown model"})
+                return
+            model_name, _ = target
+            try:
+                model = self.server.manager.model_settings.get_model(model_name)
+            except SettingsNotFoundError as exc:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
+                return
+            self._send_settings_snapshot(extra={"model": model})
         elif parsed.path in ("/api/database", "/api/database/path", "/api/info"):
             self._send_json(
                 HTTPStatus.OK,
@@ -3657,6 +6060,8 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
+        if self._dispatch_model_settings_write("POST", parsed.path):
+            return
         if parsed.path.startswith("/api/stop/"):
             session_id = parsed.path.removeprefix("/api/stop/").strip("/")
             self._stop_session(session_id)
@@ -3679,10 +6084,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             task = payload.get("task", "")
             images = payload.get("images", [])
             session_id = payload.get("session_id") or ""
+            model_name = payload.get("model_name") or payload.get("model") or ""
             if not isinstance(task, str):
                 raise ValueError("task must be a string")
             if not isinstance(session_id, str):
                 raise ValueError("session_id must be a string")
+            if not isinstance(model_name, str):
+                raise ValueError("model_name must be a string")
             if images is None:
                 images = []
             if not isinstance(images, list) or not all(isinstance(image, str) for image in images):
@@ -3693,13 +6101,15 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 if not image.startswith(("data:image/", "http://", "https://")):
                     raise ValueError("images must be data URLs or http(s) URLs")
             if session_id:
-                continued = self.server.manager.continue_session(session_id, task, images=images)
+                continued = self.server.manager.continue_session(
+                    session_id, task, images=images, model_name=model_name or None
+                )
                 if continued is None:
                     self._send_json(HTTPStatus.NOT_FOUND, {"error": "Unknown session"})
                     return
                 session, event_offset = continued
             else:
-                session = self.server.manager.start_session(task, images=images)
+                session = self.server.manager.start_session(task, images=images, model_name=model_name or None)
                 event_offset = 0
         except RuntimeError as exc:
             self._send_json(HTTPStatus.CONFLICT, {"error": str(exc)})
@@ -3721,6 +6131,21 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 "continued": bool(session_id),
             },
         )
+
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib method name
+        parsed = urlparse(self.path)
+        if not self._dispatch_model_settings_write("PUT", parsed.path):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def do_PATCH(self) -> None:  # noqa: N802 - stdlib method name
+        parsed = urlparse(self.path)
+        if not self._dispatch_model_settings_write("PATCH", parsed.path):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
+        parsed = urlparse(self.path)
+        if not self._dispatch_model_settings_write("DELETE", parsed.path):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def _stream_events(self, session: GuiSession, *, since: int = 0) -> None:
         try:

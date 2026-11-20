@@ -1,3 +1,4 @@
+import copy
 import json
 import threading
 import time
@@ -15,7 +16,9 @@ from minisweagent.models.test_models import DeterministicToolcallModel, make_too
 from minisweagent.run.gui import (
     ConversationState,
     GuiConfig,
+    GuiModelSettings,
     GuiSessionManager,
+    _qualified_model_name,
     conversation_state,
     create_server,
 )
@@ -795,3 +798,157 @@ def test_gui_run_api_continues_conversation_after_stop(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+class _RecordingToolcallModel(DeterministicToolcallModel):
+    def __init__(self, *args, queries: list, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.queries = queries
+
+    def query(self, messages, **kwargs):
+        self.queries.append(copy.deepcopy(messages))
+        return super().query(messages, **kwargs)
+
+
+def test_gui_follow_ups_keep_all_previous_instructions_as_context(tmp_path):
+    config = yaml.safe_load(Path("src/minisweagent/config/mini.yaml").read_text())
+    queries: list[list[dict]] = []
+    answer_index = 0
+
+    def agent_factory():
+        nonlocal answer_index
+        answer_index += 1
+        return DefaultAgent(
+            model=_RecordingToolcallModel(
+                outputs=[make_toolcall_output(f"answer {answer_index}", [], [])], queries=queries
+            ),
+            env=LocalEnvironment(cwd=str(tmp_path)),
+            **config["agent"],
+        )
+
+    manager = GuiSessionManager(
+        GuiConfig(agent_config=config, workspace=str(tmp_path)),
+        agent_factory=agent_factory,
+        db_path=tmp_path / "conversations.db",
+    )
+    session = manager.start_session("first instruction")
+    assert session.wait(timeout=5)
+
+    session.continue_run("second instruction")
+    assert session.wait(timeout=5)
+
+    session.continue_run("third instruction")
+    assert session.wait(timeout=5)
+
+    assert len(queries) == 3
+    third_turn_messages = queries[2]
+    third_turn_text = " ".join(str(message.get("content") or "") for message in third_turn_messages)
+    assert "first instruction" in third_turn_text
+    assert "second instruction" in third_turn_text
+    assert "third instruction" in third_turn_text
+    assert [message.get("role") for message in session.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "exit",
+    ]
+
+    # The history also survives a GUI process restart.
+    session_id = session.session_id
+    manager.close()
+    restored_manager = GuiSessionManager(
+        GuiConfig(agent_config=config, workspace=str(tmp_path)),
+        agent_factory=agent_factory,
+        db_path=tmp_path / "conversations.db",
+    )
+    restored = restored_manager.get_session(session_id)
+    assert restored is not None
+    restored.continue_run("fourth instruction")
+    assert restored.wait(timeout=5)
+    fourth_turn_text = " ".join(str(message.get("content") or "") for message in queries[3])
+    for instruction in ("first instruction", "second instruction", "third instruction", "fourth instruction"):
+        assert instruction in fourth_turn_text
+    restored_manager.close()
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "model_name", "expected"),
+    [
+        ("openai", "gpt-4o-mini", "openai/gpt-4o-mini"),
+        ("openai", "openai/gpt-4o-mini", "openai/gpt-4o-mini"),
+        ("openrouter", "openai/gpt-4o", "openrouter/openai/gpt-4o"),
+        ("custom-gateway", "meta-llama/Llama-3", "openai/meta-llama/Llama-3"),
+        ("vllm", "Qwen/Qwen3", "openai/Qwen/Qwen3"),
+    ],
+)
+def test_provider_model_names_are_qualified_for_litellm(provider_id, model_name, expected):
+    assert _qualified_model_name(provider_id, model_name) == expected
+
+
+def test_loading_provider_models_qualifies_names_and_upgrades_existing_models(tmp_path, monkeypatch):
+    settings = GuiModelSettings(tmp_path / "gui_settings.json")
+    settings.add_provider({"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1"})
+    settings.add_model({"model_name": "gpt-4o-mini", "provider": "openai"})
+
+    monkeypatch.setattr(
+        "minisweagent.run.gui._query_provider_models",
+        lambda provider, *, timeout=15.0: [
+            {"model_name": "gpt-4o-mini", "name": "GPT-4o mini"},
+            {"model_name": "gpt-4.1", "name": "GPT-4.1"},
+        ],
+    )
+    snapshot = settings.load_provider_models("openai")
+
+    assert [model["model_name"] for model in snapshot["enabled_models"]] == [
+        "openai/gpt-4o-mini",
+        "openai/gpt-4.1",
+    ]
+    assert snapshot["active_model"] == "openai/gpt-4o-mini"
+    assert snapshot["fetched_models"] == ["gpt-4o-mini", "gpt-4.1"]
+    assert [model["model_name"] for model in snapshot["loaded_models"]] == ["openai/gpt-4.1"]
+
+
+def test_model_config_adds_provider_prefix_when_calling_existing_raw_model_name(tmp_path):
+    manager = GuiSessionManager(
+        GuiConfig(agent_config={"model": {}}),
+        agent_factory=_FakeAgent,
+        db_path=tmp_path / "conversations.db",
+    )
+    manager.model_settings.add_provider({"id": "openai", "name": "OpenAI"})
+    manager.model_settings.add_model({"model_name": "gpt-4o-mini", "provider": "openai"})
+
+    config = manager._config_for_model("gpt-4o-mini")
+
+    assert config.model_name == "openai/gpt-4o-mini"
+    assert config.agent_config["model"]["model_name"] == "openai/gpt-4o-mini"
+    manager.close()
+
+
+def test_provider_model_list_is_grouped_and_delete_cascades_to_models(tmp_path):
+    settings = GuiModelSettings(tmp_path / "gui_settings.json")
+    settings.add_provider({"id": "openai", "name": "OpenAI"})
+    settings.add_provider({"id": "anthropic", "name": "Anthropic"})
+    settings.add_model({"model_name": "openai/gpt-4o", "provider": "openai"})
+    settings.add_model({"model_name": "openai/gpt-4.1", "provider": "openai"})
+    settings.add_model({"model_name": "anthropic/claude-sonnet", "provider": "anthropic"})
+
+    openai = next(provider for provider in settings.list_providers() if provider["id"] == "openai")
+    assert openai["model_count"] == 2
+    assert openai["models"] == ["openai/gpt-4o", "openai/gpt-4.1"]
+
+    settings.delete_provider("openai")
+    assert [provider["id"] for provider in settings.list_providers()] == ["anthropic"]
+    assert [model["model_name"] for model in settings.list_models()] == ["anthropic/claude-sonnet"]
+
+
+def test_gui_html_exposes_expandable_provider_model_groups():
+    from minisweagent.run.gui import _HTML
+
+    assert "Click a provider to show its models" in _HTML
+    assert 'className = "provider-models"' in _HTML
+    assert "function toggleProviderModels" in _HTML
+    assert '"Add model"' in _HTML

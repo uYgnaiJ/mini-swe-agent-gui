@@ -199,6 +199,21 @@ class ConversationStore:
             ).fetchall()
         return [json.loads(row["data"]) for row in rows]
 
+    def load_trajectory(self, session_id: str) -> dict[str, Any] | None:
+        """Return the latest persisted agent trajectory for a conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT trajectory FROM conversations WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        if row is None or row["trajectory"] is None:
+            return None
+        try:
+            trajectory = json.loads(row["trajectory"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        return trajectory if isinstance(trajectory, dict) else None
+
     def export_conversation(self, session_id: str) -> dict[str, Any] | None:
         """Build a self-contained, downloadable JSON representation of a conversation."""
         with self._lock:
