@@ -1625,3 +1625,11 @@ assert.equal(entries[0]._activityVisibility, 1);
 """
     completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
+
+
+def test_gui_javascript_case_labels_are_quoted_strings():
+    """`case error:` is valid JavaScript but throws at runtime for every event."""
+    from minisweagent.run.gui import _HTML
+
+    script = re.findall(r"<script>(.*?)</script>", _HTML, re.DOTALL)[0]
+    assert not re.search(r"^\s*case\s+[A-Za-z_]\w*\s*:", script, re.MULTILINE)

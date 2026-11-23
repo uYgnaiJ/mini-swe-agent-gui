@@ -1437,13 +1437,9 @@ _HTML = r"""<!doctype html>
     aside { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 12px; }
     aside.conversations, aside.details { position: sticky; top: 14px; align-self: start; height: calc(100dvh - 28px); }
     aside.details { overflow: hidden; }
-    .details-settings { flex: 0 0 auto; display: flex; justify-content: flex-end; }
+    .details-settings { flex: 0 0 auto; display: flex; justify-content: flex-end; gap: 8px; }
+    .details-settings .tree-toggle { flex: 1 1 auto; min-width: 0; justify-content: space-between; }
     .stats { padding: 16px; flex: 0 0 auto; }
-    .tree-panel { flex: 0 0 auto; padding: 0; overflow: hidden; }
-    .tree-toggle { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border: 0; background: transparent; color: var(--text); font-weight: 700; cursor: pointer; }
-    .tree-toggle::before { content: "▸"; color: var(--muted); }
-    .tree-toggle[aria-expanded="true"]::before { content: "▾"; }
-    .tree-toggle > span:first-child { flex: 1; text-align: left; margin-left: 7px; }
     .tree-count { color: var(--muted); font-size: 11px; }
     .main-tree-view { position: absolute; inset: 0; z-index: 6; overflow: auto; padding: 18px; background: var(--bg); }
     .main-tree-view[hidden] { display: none; }
@@ -1476,7 +1472,6 @@ _HTML = r"""<!doctype html>
     .user-editor textarea { width: 100%; min-height: 64px; max-height: 320px; resize: vertical; padding: 9px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
     .user-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }
     .user-editor-actions button { padding: 6px 10px; }
-    body.activity-expanded aside.details .tree-panel { display: none; }
     .stats h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; }
     .stat { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
     .stat:last-child { border-bottom: 0; }
@@ -2128,6 +2123,9 @@ _HTML = r"""<!doctype html>
     </section>
     <aside class="details">
       <div class="details-settings">
+        <button id="tree-toggle" class="settings-button tree-toggle" type="button" aria-expanded="false" aria-controls="main-tree-view" title="Open current conversation tree">
+          <span>Tree</span><span id="tree-count" class="tree-count">0</span>
+        </button>
         <button id="settings-button" class="settings-button" type="button" aria-haspopup="dialog" aria-controls="settings-modal" title="Open settings"><span class="gear" aria-hidden="true">&#9881;</span><span>Settings</span></button>
       </div>
       <div class="panel stats">
@@ -2140,11 +2138,6 @@ _HTML = r"""<!doctype html>
         <div class="stat"><span>Input</span><span id="stat-input">-</span></div>
         <div class="stat"><span>Output</span><span id="stat-output">-</span></div>
       </div>
-      <section class="panel tree-panel" id="tree-panel">
-        <button id="tree-toggle" class="tree-toggle" type="button" aria-expanded="false" aria-controls="main-tree-view">
-          <span>Conversation tree</span><span id="tree-count" class="tree-count">0</span>
-        </button>
-      </section>
 
       <section class="panel activity" id="activity-panel" aria-label="Activity timeline">
         <div class="activity-header">
@@ -2382,7 +2375,10 @@ _HTML = r"""<!doctype html>
     let eventSource = null;
     let activeSessionId = null;
     let replayingHistory = false;
+    let lastEventOffset = 0;
+    let lastEventType = "";
     let selectedSessionId = null;
+    let conversationSelectionVersion = 0;
     let pendingTreeNavigation = null;
     let conversationTreeEdges = [];
     let conversationTreeDots = new Map();
@@ -5091,19 +5087,40 @@ _HTML = r"""<!doctype html>
 
     async function selectConversation(sessionId) {
       if (!sessionId) return;
+      const selectionVersion = ++conversationSelectionVersion;
       setConversationTreeExpanded(false);
       if (sessionId === selectedSessionId && eventSource) return;
       closeEventStream();
+      activeSessionId = sessionId;
       selectedSessionId = sessionId;
       rememberSession(sessionId);
       const conversation = conversations.find((item) => conversationId(item) === sessionId);
       renderConversationList();
       resetRunView(conversation || { session_id: sessionId });
       if (!conversation) setStatus("loading", "running");
-      // Historical conversations contain one `done` event per turn.  Do not let
-      // the first one close the stream before later turns have been replayed.
       replayingHistory = true;
-      connectEvents(sessionId);
+      try {
+        const snapshot = await apiRequest("/api/sessions/" + encodeURIComponent(sessionId));
+        if (selectionVersion !== conversationSelectionVersion || selectedSessionId !== sessionId) return;
+        const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+        for (let index = 0; index < events.length; index++) {
+          const event = events[index];
+          try { handleEvent(event); }
+          catch (err) { console.error("Bad event", err, event); }
+          lastEventOffset = index + 1;
+          lastEventType = event.type || "";
+        }
+        replayingHistory = false;
+        const currentConversation = snapshot.conversation || snapshot.session || conversation;
+        if (!currentConversation || !currentConversation.done) {
+          connectEvents(sessionId, events.length);
+        }
+      } catch (err) {
+        if (selectionVersion !== conversationSelectionVersion || selectedSessionId !== sessionId) return;
+        replayingHistory = false;
+        console.error("Could not load conversation", err);
+        setStatus("load failed", "error");
+      }
     }
 
     function handleEvent(event) {
@@ -5320,7 +5337,7 @@ _HTML = r"""<!doctype html>
           updateActivitySummary();
           break;
         }
-        case error: {
+        case "error": {
           finishActivityThinking(activityEventTime(event));
           currentAssistant = null;
           currentReasoning = null;
@@ -5376,9 +5393,11 @@ _HTML = r"""<!doctype html>
               total_tokens: currentTokenUsage.total,
             },
           });
-          if (!replayingHistory) closeEventStream();
+          if (!replayingHistory) {
+            closeEventStream();
+            setTimeout(() => loadConversations(), 250);
+          }
           setComposerRunning(false);
-          setTimeout(() => loadConversations(), 250);
           break;
         }
       }
@@ -5397,13 +5416,19 @@ _HTML = r"""<!doctype html>
     function connectEvents(sessionId, eventOffset = 0) {
       closeEventStream();
       activeSessionId = sessionId;
+      lastEventOffset = eventOffset;
+      lastEventType = "";
       const suffix = eventOffset > 0 ? "?since=" + encodeURIComponent(eventOffset) : "";
       const source = new EventSource("/api/events/" + encodeURIComponent(sessionId) + suffix);
       eventSource = source;
       source.onmessage = (message) => {
         if (eventSource !== source) return;
-        try { handleEvent(JSON.parse(message.data)); }
-        catch (err) { console.error("Bad event", err, message.data); }
+        try {
+          const event = JSON.parse(message.data);
+          handleEvent(event);
+          lastEventOffset += 1;
+          lastEventType = event.type || "";
+        } catch (err) { console.error("Bad event", err, message.data); }
       };
       source.onerror = async () => {
         if (eventSource !== source) return;
@@ -5424,6 +5449,26 @@ _HTML = r"""<!doctype html>
         } else if (conversation) {
           // The summary is authoritative for finished runs.
           applyConversationStatus(conversation);
+          if (conversation.done && lastEventType !== "done") {
+            // The terminal event was lost with the connection. Replay the
+            // missing tail so the activity panel also shows "Submitted".
+            try {
+              const snapshot = await apiRequest("/api/sessions/" + encodeURIComponent(sessionId));
+              const events = Array.isArray(snapshot.events) ? snapshot.events : [];
+              const wasReplaying = replayingHistory;
+              replayingHistory = true;
+              for (let index = lastEventOffset; index < events.length; index++) {
+                const event = events[index];
+                try { handleEvent(event); }
+                catch (err) { console.error("Bad event", err, event); }
+                lastEventOffset = index + 1;
+                lastEventType = event.type || "";
+              }
+              replayingHistory = wasReplaying;
+            } catch (err) {
+              console.error("Could not replay missing events", err);
+            }
+          }
         }
       };
     }
