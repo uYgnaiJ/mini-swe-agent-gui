@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from minisweagent.agents.default import DefaultAgent
+from minisweagent.agents.default import DefaultAgent, _extract_json_object
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import FormatError
 from minisweagent.models import GLOBAL_MODEL_STATS
@@ -813,3 +813,57 @@ def test_auto_budget_reports_summary_when_extension_cap_is_reached(toolcall_conf
     assert result["exit_status"] == "Submitted"
     assert result["submission"] == "Found the problem: X."
     assert agent.n_calls == 4
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"a": 1}', {"a": 1}),
+        ('prefix\n```json\n{"status": "report", "answer": "ok"}\n```\nsuffix', {"status": "report", "answer": "ok"}),
+        ("no json here", None),
+        ('{"broken": }', None),
+    ],
+)
+def test_extract_json_object(text, expected):
+    assert _extract_json_object(text) == expected
+
+
+def test_auto_budget_falls_back_to_plain_summary_when_checkpoint_json_fails(toolcall_config):
+    model = make_tc_model(
+        [
+            (_plan_json(steps=2), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            ("I cannot return JSON right now, but the work is progressing.", []),
+            ("Summary: the checks pass and nothing else is needed.", []),
+        ],
+        cost_per_call=0.0,
+    )
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **_budget_config(toolcall_config))
+
+    result = agent.run("investigate")
+
+    assert result["exit_status"] == "Submitted"
+    assert result["submission"] == "Summary: the checks pass and nothing else is needed."
+
+
+def test_auto_budget_explains_limits_exceeded_when_no_summary_is_available(toolcall_config, monkeypatch):
+    model = make_tc_model(
+        [
+            (_plan_json(steps=2), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            ("not json", []),
+        ],
+        cost_per_call=0.0,
+    )
+    monkeypatch.setattr(DefaultAgent, "_plain_text_summary", lambda self: "")
+    events: list[dict] = []
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **_budget_config(toolcall_config))
+    agent.set_event_callback(events.append)
+
+    result = agent.run("investigate")
+
+    assert result["exit_status"] == "LimitsExceeded"
+    assert result["message"] == "Stopped after reaching the 2-step budget and no summary could be generated."
+    assert events[-1]["message"] == result["message"]

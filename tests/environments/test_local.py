@@ -1,6 +1,7 @@
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -262,3 +263,37 @@ def test_local_environment_shell_features():
     result = env.execute({"command": "echo $(echo 'nested')"})
     assert result["returncode"] == 0
     assert "nested" in result["output"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific process-tree termination")
+def test_local_environment_timeout_kills_windows_descendants_without_hanging(tmp_path):
+    """A descendant holding the stdout pipe must not block the timeout forever."""
+    pid_file = tmp_path / "child.pid"
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import subprocess, sys, time",
+                "from pathlib import Path",
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+                f"Path({str(pid_file)!r}).write_text(str(child.pid))",
+                "time.sleep(60)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    env = LocalEnvironment(timeout=1)
+    started = time.monotonic()
+    result = env.execute({"command": f'"{sys.executable}" "{script}"'})
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 20
+    assert result["extra"]["exception_type"] == "TimeoutExpired"
+    child_pid = _read_pid(pid_file)
+    assert not _windows_process_running(child_pid)
+
+
+def _windows_process_running(pid: int) -> bool:
+    result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, timeout=10)
+    return str(pid) in result.stdout

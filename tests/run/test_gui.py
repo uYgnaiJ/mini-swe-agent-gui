@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import shutil
 import subprocess
 import threading
@@ -19,6 +20,7 @@ from minisweagent.run.gui import (
     ConversationState,
     GuiConfig,
     GuiModelSettings,
+    GuiSession,
     GuiSessionManager,
     _qualified_model_name,
     build_gui_config,
@@ -107,7 +109,7 @@ def test_gui_exposes_the_conversation_database_path(tmp_path):
 
         with urllib.request.urlopen(base_url + "/") as response:
             html = response.read().decode()
-        assert 'id="database-path"' in html
+        assert 'id="settings-database"' in html
         assert "SQLite: " in html
     finally:
         server.shutdown()
@@ -136,10 +138,11 @@ def test_gui_serves_html_and_streams_session_events(tmp_path):
         assert "/api/conversations" in html
         assert 'id="conversation-state-summary"' not in html
         assert "renderConversationStateSummary" not in html
-        header = html.split("<header>", 1)[1].split("</header>", 1)[0]
+        assert "<header" not in html
         conversation_section = html.split("<section>", 1)[1].split("</section>", 1)[0]
-        assert 'id="status"' not in header
-        assert 'id="status"' in conversation_section
+        assert 'id="status"' not in conversation_section
+        activity_section = html.split('id="activity-panel"', 1)[1].split("</section>", 1)[0]
+        assert 'id="status"' in activity_section
         assert 'id="conversation-label"' in conversation_section
         assert 'id="conversation-workspace"' in conversation_section
         composer = conversation_section.split('<div class="panel composer">', 1)[1]
@@ -187,14 +190,15 @@ def test_gui_serves_html_and_streams_session_events(tmp_path):
         assert "Run started" in html
         assert "Run finished" in html
         assert 'id="stat-tokens"' in html
-        assert 'id="stat-token-detail"' in html
+        assert 'id="stat-input"' in html
+        assert 'id="stat-output"' in html
         assert "updateTokenStatsFromAssistant" in html
         assert "total_tokens_used" in html
         assert 'id="activity-summary"' in html
         assert 'id="activity-overview"' in html
         assert 'id="activity-scroll"' in html
         assert 'id="activity-expand"' in html
-        assert "Step-by-step trajectory of model calls, tool runs, and outcomes." in html
+        assert "Step-by-step trajectory of model calls, tool runs, and outcomes." not in html
         assert "function addActivityStep" in html
         assert "function addToolActivity" in html
         assert "function updateToolActivity" in html
@@ -227,6 +231,8 @@ def test_gui_serves_html_and_streams_session_events(tmp_path):
         assert "updateConversationStatus(sessionId, {" in stop_run
 
         with urllib.request.urlopen(base_url + "/api/health") as response:
+            assert json.load(response) == {"status": "ok"}
+        with urllib.request.urlopen(base_url + "/health") as response:
             assert json.load(response) == {"status": "ok"}
 
         request = urllib.request.Request(
@@ -305,7 +311,7 @@ def test_gui_lists_all_conversations_and_replays_their_events(tmp_path):
         with urllib.request.urlopen(base_url + f"/api/conversations/{first.session_id}") as response:
             detail = json.load(response)
         assert detail["conversation"]["task"] == "First conversation"
-        assert detail["events"][0] == {"type": "run_start", "task": "First conversation"}
+        assert detail["events"][0].items() >= {"type": "run_start", "task": "First conversation"}.items()
         assert detail["events"][-1]["type"] == "done"
     finally:
         server.shutdown()
@@ -409,7 +415,8 @@ def test_gui_stop_button_stops_running_session(tmp_path):
             if detail["events"]:
                 break
             time.sleep(0.01)
-        assert detail["events"] == [{"type": "run_start", "task": "Keep running"}]
+        assert len(detail["events"]) == 1
+        assert detail["events"][0].items() >= {"type": "run_start", "task": "Keep running"}.items()
 
         stop_request = urllib.request.Request(base_url + f"/api/stop/{session_id}", method="POST")
         with urllib.request.urlopen(stop_request) as response:
@@ -497,7 +504,7 @@ def test_gui_conversations_persist_and_export_across_restarts(tmp_path):
     assert loaded.summary()["task"] == "Persist me"
     assert loaded.summary()["done"] is True
     assert loaded.summary()["total_tokens"] == 150
-    assert loaded.events[0] == {"type": "run_start", "task": "Persist me"}
+    assert loaded.events[0].items() >= {"type": "run_start", "task": "Persist me"}.items()
     assert loaded.events[-1]["type"] == "done"
 
     exported = restored.export_session(session.session_id)
@@ -783,7 +790,7 @@ def test_gui_run_api_continues_conversation_after_stop(tmp_path):
 
         detail = wait_for(follow_up_started)
         assert [event["type"] for event in detail["events"]].count("run_start") == 2
-        assert detail["events"][-1] == {"type": "run_start", "task": "second turn"}
+        assert detail["events"][-1].items() >= {"type": "run_start", "task": "second turn"}.items()
 
         stop_request = urllib.request.Request(base_url + f"/api/stop/{session_id}", method="POST")
         with urllib.request.urlopen(stop_request) as response:
@@ -1093,6 +1100,483 @@ assert.ok(rendered.includes('href="https://example.com?a=1&amp;b=2"'));
 assert.ok(!rendered.includes('href="javascript:'));
 assert.ok(!rendered.includes('<script>'));
 assert.ok(rendered.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_run_context_uses_latest_model_call_tokens():
+    from minisweagent.run.gui import _HTML
+
+    assert 'id="stat-context"' in _HTML
+    assert "<span>Context</span>" in _HTML
+    assert "setContextStats(callTotal, callPrompt, callCompletion);" in _HTML
+    assert _HTML.count("setContextStats(0);") == 2
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute the embedded context calculation")
+
+    numeric = "    function numeric" + _HTML.split("    function numeric", 1)[1].split("    function formatTokens", 1)[0]
+    context = "    function contextLengthFromAssistant" + _HTML.split("    function contextLengthFromAssistant", 1)[1].split(
+        "    function setContextStats", 1
+    )[0]
+    script = numeric + "\n" + context + r"""
+const assert = require('node:assert/strict');
+const event = {
+  prompt_tokens: 120,
+  completion_tokens: 30,
+  total_tokens: 150,
+  cumulative_usage: { prompt_tokens: 720, completion_tokens: 180, total_tokens: 900 }
+};
+assert.equal(contextLengthFromAssistant(event, 120, 30), 150);
+assert.equal(contextLengthFromAssistant({ usage: {} }, 80, 20), 100);
+assert.equal(contextLengthFromAssistant({ usage: {} }, 0, 0), 0);
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_conversation_metadata_branching_and_delete_api(tmp_path):
+    manager = GuiSessionManager(
+        GuiConfig(agent_config={}), agent_factory=_FakeAgent, db_path=tmp_path / "conversations.db"
+    )
+    source = manager.start_session("original")
+    assert source.wait(timeout=5)
+    manager.continue_session(source.session_id, "follow up")
+    assert source.wait(timeout=5)
+    server = create_server("127.0.0.1", 0, manager)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+
+    def request(method, path, payload=None):
+        body = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(
+            base_url + path,
+            data=body,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return response.status, json.load(response)
+
+    branch_id = None
+    try:
+        status, renamed = request("PATCH", f"/api/conversations/{source.session_id}", {"title": "Renamed"})
+        assert status == 200
+        assert renamed["conversation"]["title"] == "Renamed"
+        assert renamed["conversation"]["task"] == "original"
+
+        status, pinned = request("PATCH", f"/api/conversations/{source.session_id}", {"pinned": True})
+        assert status == 200
+        assert pinned["conversation"]["pinned"] is True
+
+        status, branched = request(
+            "POST",
+            f"/api/conversations/{source.session_id}/branch",
+            {"task": "edited follow up", "turn_index": 1},
+        )
+        assert status == 202
+        branch_id = branched["session_id"]
+        branch = manager.get_session(branch_id)
+        assert branch is not None and branch.wait(timeout=5)
+        assert branched["branched_from"] == source.session_id
+        assert branch.parent_id == source.session_id
+        assert [event["task"] for event in branch.events if event.get("type") == "run_start"] == [
+            "original",
+            "edited follow up",
+        ]
+        assert [event["task"] for event in source.events if event.get("type") == "run_start"] == [
+            "original",
+            "follow up",
+        ]
+
+        status, listing = request("GET", "/api/conversations")
+        assert status == 200
+        assert listing["conversations"][0]["title"] == "Renamed"
+        stored = {item["session_id"]: item for item in manager.store.load_sessions()}
+        assert stored[source.session_id]["pinned"] is True
+        assert stored[branch_id]["parent_id"] == source.session_id
+        assert stored[branch_id]["branch_turn_index"] == 1
+        assert [turn["task"] for turn in branch.summary()["turns"]] == ["original", "edited follow up"]
+
+        status, deleted = request("DELETE", f"/api/conversations/{source.session_id}")
+        assert status == 200 and deleted["deleted"] == source.session_id
+        assert manager.get_session(source.session_id) is None
+        assert manager.get_session(branch_id) is not None
+        assert source.session_id not in {item['session_id'] for item in manager.store.load_sessions()}
+        deleted_records = {item['session_id']: item for item in manager.store.load_sessions(include_deleted=True)}
+        assert deleted_records[source.session_id]['deleted_at'] > 0
+        assert manager.store.load_events(source.session_id)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        manager.close()
+
+    assert branch_id is not None
+    restored = GuiSessionManager(
+        GuiConfig(agent_config={}), agent_factory=_FakeAgent, db_path=tmp_path / "conversations.db"
+    )
+    try:
+        restored_branch = restored.get_session(branch_id)
+        assert restored_branch is not None
+        assert restored_branch.parent_id == source.session_id
+        assert [event.get("task") for event in restored_branch.events if event.get("type") == "run_start"] == [
+            "original",
+            "edited follow up",
+        ]
+        assert restored.get_session(source.session_id) is None
+    finally:
+        restored.close()
+
+def test_restored_session_continues_after_highest_persisted_event_index(tmp_path):
+    store = ConversationStore(tmp_path / "conversations.db")
+    session_id = "gap"
+    store.save_events(
+        session_id,
+        [
+            (5, {"type": "run_start", "task": "old"}),
+            (9, {"type": "done", "exit_status": "Submitted"}),
+        ],
+    )
+    entries = store.load_event_entries(session_id)
+    session = GuiSession.restore(
+        {"session_id": session_id, "task": "old", "created_at": time.time(), "done": True},
+        [event for _, event in entries],
+        config=GuiConfig(agent_config={}),
+        store=store,
+        event_indices=[index for index, _ in entries],
+    )
+
+    session.emit({"type": "plan", "steps": 1})
+
+    assert [index for index, _ in store.load_event_entries(session_id)] == [5, 9, 10]
+    store.close()
+
+
+def test_gui_custom_context_menus_and_tree_are_wired():
+    from minisweagent.run.gui import _HTML
+
+    menu = _HTML.split("function openContextMenu", 1)[1].split("async function conversationRequest", 1)[0]
+    assert "event.preventDefault();" in menu
+    assert "showConversationContextMenu(event, id)" in _HTML
+    assert "Rename" in _HTML and "Pin to top" in _HTML and "Delete" in _HTML
+    assert "beginUserEdit(card)" in _HTML
+    assert "Edit and create branch" in _HTML
+    assert "/branch" in _HTML
+    assert "function renderConversationTree()" in _HTML
+    assert "conversation.parent_id" in _HTML
+    assert _HTML.index('id="tree-panel"') < _HTML.index('id="activity-panel"')
+
+def test_gui_sent_images_open_in_app_preview():
+    from minisweagent.run.gui import _HTML
+
+    assert 'id="image-preview"' in _HTML
+    assert 'role="dialog"' in _HTML
+    assert "function openImagePreview(url)" in _HTML
+    card = _HTML.split("function addUserCard", 1)[1].split("function renderPendingImages", 1)[0]
+    assert "event.preventDefault();" in card
+    assert "openImagePreview(url);" in card
+    assert "Close image preview" in _HTML
+    assert "closeImagePreview();" in _HTML
+    assert "image-preview-open" in _HTML
+
+def test_gui_turn_tree_is_limited_to_current_family():
+    from minisweagent.run.gui import _HTML
+
+    assert 'id="main-tree-view"' in _HTML
+    assert "function currentConversationTree()" in _HTML
+    assert "function navigateToTreeNode(node)" in _HTML
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute the turn-tree builder")
+    builder = "    function currentConversationTree" + _HTML.split("    function currentConversationTree", 1)[1].split(
+        "    function drawConversationTreeEdges", 1
+    )[0]
+    script = r"""
+const assert = require('node:assert/strict');
+const conversations = [
+  { session_id: 'other', task: 'unrelated', turns: [{ task: 'unrelated' }], created_at: 1 },
+  { session_id: 'root', task: 'first', turns: [{ task: 'first' }, { task: 'original second' }], created_at: 2 },
+  {
+    session_id: 'branch', parent_id: 'root', branch_turn_index: 1, task: 'edited second', created_at: 3,
+    turns: [{ task: 'first' }, { task: 'edited second' }, { task: 'after edit' }]
+  }
+];
+const selectedSessionId = 'branch';
+function conversationId(conversation) { return conversation.session_id; }
+function conversationState() { return 'submitted'; }
+""" + builder + r"""
+const tree = currentConversationTree();
+assert.equal(tree.count, 4);
+assert.equal(tree.roots.length, 1);
+const first = tree.roots[0];
+assert.equal(first.task, 'first');
+assert.deepEqual(first.children.map((node) => node.task), ['original second', 'edited second']);
+assert.equal(first.children[1].children[0].task, 'after edit');
+assert.ok(!JSON.stringify(tree).includes('unrelated'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_tool_jump_flashes_activity_detail_edge_once():
+    from minisweagent.run.gui import _HTML
+
+    assert "@keyframes activity-edge-flash" in _HTML
+    assert "animation: activity-edge-flash 1100ms ease-out 1 both;" in _HTML
+    jump = _HTML.split("function openToolActivity", 1)[1].split("function makeToolCall", 1)[0]
+    assert jump.index("entry.scrollIntoView") < jump.index("flashActivityEntryWhenSettled(entry);")
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute the Activity flash helper")
+    flash = "    function flashActivityEntry" + _HTML.split("    function flashActivityEntry", 1)[1].split(
+        "    function openToolActivity", 1
+    )[0]
+    script = flash + r"""
+const assert = require('node:assert/strict');
+const classes = new Set();
+const operations = [];
+const listeners = [];
+const entry = {
+  classList: {
+    add: (name) => { classes.add(name); operations.push('add'); },
+    remove: (name) => { classes.delete(name); operations.push('remove'); }
+  },
+  addEventListener: (name, callback, options) => listeners.push({ callback, options }),
+  offsetWidth: 1
+};
+flashActivityEntry(entry);
+flashActivityEntry(entry);
+assert.deepEqual(operations, ['remove', 'add', 'remove', 'add']);
+assert.ok(classes.has('activity-highlight'));
+assert.equal(listeners.length, 2);
+assert.ok(listeners.every((listener) => listener.options.once));
+listeners.at(-1).callback();
+assert.ok(!classes.has('activity-highlight'));
+
+let now = 0;
+const frames = [];
+global.performance = { now: () => now };
+global.requestAnimationFrame = (callback) => frames.push(callback);
+global.activityScroller = { scrollTop: 0 };
+entry.isConnected = true;
+flashActivityEntryWhenSettled(entry);
+frames.shift()();
+now = 50;
+activityScroller.scrollTop = 200;
+frames.shift()();
+now = 80;
+frames.shift()();
+now = 120;
+frames.shift()();
+now = 140;
+frames.shift()();
+assert.ok(!classes.has('activity-highlight'));
+now = 160;
+frames.shift()();
+assert.ok(classes.has('activity-highlight'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_tree_is_button_only_with_dot_line_nodes():
+    from minisweagent.run.gui import _HTML
+
+    panel = _HTML.split('id="tree-panel"', 1)[1].split('id="activity-panel"', 1)[0]
+    assert 'aria-controls="main-tree-view"' in panel
+    assert 'id="conversation-tree"' not in panel
+    assert "main-tree-dot" in _HTML
+    assert "main-tree-node-row" in _HTML
+    assert "main-tree-children.branched" in _HTML
+    assert ".main-tree-connectors" in _HTML
+    assert "function drawConversationTreeEdges()" in _HTML
+    assert "conversationTreeEdges.push({ parent: node.id, child: child.id });" in _HTML
+    assert "node.children.length === 1 ? 'single' : 'branched'" in _HTML
+
+def test_gui_headerless_docked_layout_and_compact_controls():
+    from minisweagent.run.gui import _HTML
+
+    assert '<header' not in _HTML
+    main_css = _HTML.split('    main {', 1)[1].split('}', 1)[0]
+    assert 'grid-template-columns: 280px minmax(0, 1fr) 340px;' in main_css
+    assert 'width: 100%;' in main_css and 'max-width: none;' in main_css
+    assert 'aside.conversations, aside.details { position: sticky;' in _HTML
+    details = _HTML.split('<aside class="details">', 1)[1].split('</aside>', 1)[0]
+    assert details.index('id="settings-button"') < details.index('class="panel stats"')
+    assert _HTML.count('id="status"') == 1
+    assert 'id="stat-status"' not in _HTML and 'id="stat-exit"' not in _HTML
+    assert 'id="stat-input"' in _HTML and 'id="stat-output"' in _HTML
+    assert 'model-switcher-provider' not in _HTML
+    assert 'model-switcher-label' not in _HTML
+    assert '>Task</span>' not in _HTML
+    assert '.card.user.editing' in _HTML
+    assert 'requestAnimationFrame(resizeEditor);' in _HTML
+
+
+def test_gui_embedded_javascript_is_syntactically_valid(tmp_path):
+    """A JS syntax error disables the whole page; catch it before shipping."""
+    from minisweagent.run.gui import _HTML
+
+    scripts = re.findall(r"<script>(.*?)</script>", _HTML, re.DOTALL)
+    assert scripts
+    script_path = tmp_path / "gui.js"
+    script_path.write_text("\n".join(scripts), encoding="utf-8")
+    completed = subprocess.run(["node", "--check", str(script_path)], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_activity_status_is_centered_aurora_without_pulse():
+    from minisweagent.run.gui import _HTML
+
+    assert "Step-by-step trajectory of model calls, tool runs, and outcomes." not in _HTML
+    assert "grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);" in _HTML
+    assert ".activity-heading > .status { justify-self: center;" in _HTML
+    heading_css = _HTML.split(".activity-heading {", 1)[1].split("}", 1)[0]
+    assert "overflow: hidden;" in heading_css
+    assert "border-radius: 12px;" in heading_css
+    assert _HTML.count("inset: 0;") >= 2
+    assert _HTML.count("border-radius: inherit;") >= 2
+    assert "perspective(500px)" not in _HTML
+    assert "inset: -10px -14px;" not in _HTML
+    assert '.activity-heading[data-status="running"]::before { animation: silk-flow' in _HTML
+    assert "mask-image: linear-gradient(180deg, #000 0%, transparent 100%);" in _HTML
+    assert "@keyframes silk-flow" in _HTML
+    assert ".activity-heading::before" in _HTML
+    assert ".activity-heading::after" in _HTML
+    assert "statusEl.parentElement.dataset.status" in _HTML
+    assert '.activity-heading[data-status="submitted"]::before' not in _HTML
+    assert "@keyframes pulse" not in _HTML
+    assert ".status.running::before" not in _HTML
+
+def test_gui_branch_edges_share_origin_and_reach_distinct_children():
+    from minisweagent.run.gui import _HTML
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute SVG edge geometry")
+    draw = "    function drawConversationTreeEdges" + _HTML.split("    function drawConversationTreeEdges", 1)[1].split(
+        "    function scheduleConversationTreeEdges", 1
+    )[0]
+    script = draw + r"""
+const assert = require('node:assert/strict');
+const paths = [];
+const svg = {
+  classList: { add() {} },
+  setAttribute() {},
+  appendChild(path) { paths.push(path); }
+};
+global.document = {
+  createElementNS(namespace, type) {
+    if (type === 'svg') return svg;
+    return { attributes: {}, setAttribute(name, value) { this.attributes[name] = value; } };
+  }
+};
+global.mainTreeView = { hidden: false, scrollLeft: 0, scrollTop: 0 };
+global.mainConversationTree = {
+  querySelector: () => null,
+  getBoundingClientRect: () => ({ left: 0, top: 0 }),
+  clientWidth: 500, scrollWidth: 500, scrollHeight: 400,
+  prepend() {}
+};
+const rect = (left, top) => ({ left, top, width: 12, height: 12 });
+global.conversationTreeEdges = [
+  { parent: 'parent', child: 'first' },
+  { parent: 'parent', child: 'second' }
+];
+global.conversationTreeDots = new Map([
+  ['parent', { getBoundingClientRect: () => rect(30, 100) }],
+  ['first', { getBoundingClientRect: () => rect(30, 150) }],
+  ['second', { getBoundingClientRect: () => rect(70, 250) }]
+]);
+drawConversationTreeEdges();
+assert.equal(paths.length, 2);
+const commands = paths.map((path) => path.attributes.d);
+assert.ok(commands[0].startsWith('M 36 106 '));
+assert.ok(commands[1].startsWith('M 36 106 '));
+assert.ok(commands[0].endsWith(' L 36 156'));
+assert.ok(commands[1].endsWith(' L 76 256'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_activity_phase_durations_and_timestamp_persistence(tmp_path):
+    manager = GuiSessionManager(
+        GuiConfig(agent_config={}), agent_factory=_FakeAgent, db_path=tmp_path / "conversations.db"
+    )
+    session = manager.start_session("timing")
+    assert session.wait(timeout=5)
+    session_id = session.session_id
+    assert session.events
+    assert all(isinstance(event.get("timestamp"), float) for event in session.events)
+    persisted = manager.store.load_events(session_id)
+    assert [event["timestamp"] for event in persisted] == [event["timestamp"] for event in session.events]
+    manager.close()
+
+    from minisweagent.run.gui import _HTML
+
+    assert "activity-legend" not in _HTML
+    assert "bar.style.flexGrow = String(segment.duration);" in _HTML
+    assert ".activity-segment.kind-thinking" in _HTML
+    assert ".activity-segment.kind-reply" in _HTML
+    assert ".activity-segment.kind-tool" in _HTML
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute Activity phase timing")
+    phases = "    function activityPhaseSegments" + _HTML.split("    function activityPhaseSegments", 1)[1].split(
+        "    function drawActivityOverview", 1
+    )[0]
+    script = phases + r"""
+const assert = require('node:assert/strict');
+const entries = [
+  {
+    hidden: false, _activityTitle: 'Step 1',
+    _activityPhases: [
+      { kind: 'thinking', startedAt: 0, endedAt: 1000 },
+      { kind: 'reply', startedAt: 1000, endedAt: 3500 }
+    ]
+  },
+  {
+    hidden: false, _activityTitle: 'Bash command',
+    _activityPhases: [{ kind: 'tool', startedAt: 3500, endedAt: 7000 }]
+  },
+  {
+    hidden: true, _activityTitle: 'Hidden command',
+    _activityPhases: [{ kind: 'tool', startedAt: 0, endedAt: 9000 }]
+  }
+];
+const segments = activityPhaseSegments(entries);
+assert.deepEqual(segments.map((segment) => segment.kind), ['thinking', 'reply', 'tool']);
+assert.deepEqual(segments.map((segment) => segment.duration), [1000, 2500, 3500]);
+assert.ok(!segments.some((segment) => segment.label === 'Hidden command'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+
+def test_gui_expanded_activity_overview_follows_viewport():
+    from minisweagent.run.gui import _HTML
+
+    assert "body.activity-expanded .activity-overview { display: none;" not in _HTML
+    assert "scheduleActivityOverview();" in _HTML
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute expanded Activity overview geometry")
+    functions = "    function activityEntriesInView" + _HTML.split("    function activityEntriesInView", 1)[1].split(
+        "    function scheduleActivityOverview", 1
+    )[0]
+    script = functions + r"""
+const assert = require('node:assert/strict');
+const entries = [
+  { hidden: false, name: 'above', getBoundingClientRect: () => ({ top: 0, bottom: 80 }) },
+  { hidden: false, name: 'visible', getBoundingClientRect: () => ({ top: 120, bottom: 180 }) },
+  { hidden: false, name: 'below', getBoundingClientRect: () => ({ top: 240, bottom: 300 }) }
+];
+global.activityLog = { querySelectorAll: () => entries };
+global.activityIsExpanded = () => true;
+global.activityScroller = { getBoundingClientRect: () => ({ top: 100, bottom: 200 }) };
+assert.deepEqual(activityEntriesInView().map((entry) => entry.name), ['visible']);
+const track = { style: {} };
+global.activityOverview = { clientWidth: 300, querySelector: () => track };
+activityScroller = { scrollHeight: 1000, clientHeight: 200, scrollTop: 400 };
+syncActivityOverviewScroll();
+assert.equal(track.style.width, '366px');
+assert.equal(track.style.transform, 'translateX(-33px)');
+activityScroller.scrollTop = 800;
+syncActivityOverviewScroll();
+assert.equal(track.style.transform, 'translateX(-66px)');
 """
     completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr

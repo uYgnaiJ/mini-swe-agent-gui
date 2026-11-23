@@ -985,44 +985,22 @@ _HTML = r"""<!doctype html>
       color: var(--text);
       font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
-    header {
-      position: relative;
-      z-index: 5;
-      flex: 0 0 auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 12px 20px;
-      border-bottom: 1px solid var(--border);
-      background: color-mix(in srgb, var(--panel) 92%, transparent);
-      backdrop-filter: blur(10px);
-    }
-    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -0.01em; }
-    .brand-mark {
-      display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px;
-      background: var(--accent); color: white; font-size: 16px;
-    }
-    .header-meta { color: var(--muted); font-size: 12px; display: flex; gap: 14px; align-items: center; min-width: 0; }
-    #database-path {
-      max-width: min(52vw, 720px);
-      overflow: hidden;
-      color: var(--muted);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-      font-size: 10px;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
     .status {
-      display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 999px;
-      background: var(--accent-soft); color: var(--accent); font-weight: 600;
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: transparent;
+      color: var(--accent);
+      font-weight: 650;
     }
-    .status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-    .status.running::before { animation: pulse 1s ease-in-out infinite; }
-    .status.error, .status.failed { background: color-mix(in srgb, var(--err) 13%, transparent); color: var(--err); }
-    .status.submitted { background: color-mix(in srgb, var(--ok) 13%, transparent); color: var(--ok); }
-    .status.stopped { background: color-mix(in srgb, var(--muted) 13%, transparent); color: var(--muted); }
-    .status.interrupted { background: color-mix(in srgb, var(--warn) 13%, transparent); color: var(--warn); }
+    .status.error, .status.failed { color: var(--err); }
+    .status.submitted { color: var(--ok); }
+    .status.stopped { color: var(--muted); }
+    .status.interrupted { color: var(--warn); }
+
     .conversation-bar {
       flex: 0 0 auto;
       display: flex;
@@ -1073,17 +1051,18 @@ _HTML = r"""<!doctype html>
     .conversation-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
     .conversation-actions button { padding: 5px 9px; border-radius: 7px; font-size: 12px; white-space: nowrap; }
     .conversation-bar .status { flex: 0 0 auto; }
-    @keyframes pulse { 50% { opacity: 0.25; } }
     main {
       flex: 1;
       min-height: 0;
       display: grid;
-      grid-template-columns: 250px minmax(0, 1fr) 300px;
+      grid-template-columns: 280px minmax(0, 1fr) 340px;
       grid-template-rows: minmax(0, 1fr);
-      gap: 18px;
-      width: min(1440px, 100%);
-      margin: 0 auto;
-      padding: 18px 20px;
+      gap: 14px;
+      width: 100%;
+      max-width: none;
+      height: 100dvh;
+      margin: 0;
+      padding: 14px;
     }
     section { display: flex; flex-direction: column; min-height: 0; gap: 12px; }
     .panel {
@@ -1367,6 +1346,13 @@ _HTML = r"""<!doctype html>
     .content.markdown hr { margin: 1em 0; border: 0; border-top: 1px solid var(--border); }
     .card-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
     .card-images a { display: block; line-height: 0; }
+    .card-images a { cursor: zoom-in; }
+    body.preview-open { overflow: hidden; }
+    .image-preview { position: fixed; inset: 0; z-index: 10020; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 48px 24px 24px; background: rgb(0 0 0 / 82%); }
+    .image-preview[hidden] { display: none; }
+    .image-preview img { max-width: 94vw; max-height: 84vh; object-fit: contain; border-radius: 8px; box-shadow: 0 12px 50px rgb(0 0 0 / 45%); }
+    .image-preview-close { position: absolute; top: 12px; right: 16px; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 50%; background: rgb(255 255 255 / 14%); color: white; font-size: 26px; cursor: pointer; }
+    .image-preview a { color: white; text-decoration: underline; }
     .card-images img {
       max-width: 220px; max-height: 220px; border-radius: 8px;
       border: 1px solid var(--border); object-fit: contain; background: var(--bg);
@@ -1445,12 +1431,53 @@ _HTML = r"""<!doctype html>
     }
     .meta { color: var(--muted); font-size: 11px; }
     aside { min-height: 0; overflow: hidden; display: flex; flex-direction: column; gap: 12px; }
+    aside.conversations, aside.details { position: sticky; top: 14px; align-self: start; height: calc(100dvh - 28px); }
     aside.details { overflow: hidden; }
+    .details-settings { flex: 0 0 auto; display: flex; justify-content: flex-end; }
     .stats { padding: 16px; flex: 0 0 auto; }
+    .tree-panel { flex: 0 0 auto; padding: 0; overflow: hidden; }
+    .tree-toggle { width: 100%; display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border: 0; background: transparent; color: var(--text); font-weight: 700; cursor: pointer; }
+    .tree-toggle::before { content: "▸"; color: var(--muted); }
+    .tree-toggle[aria-expanded="true"]::before { content: "▾"; }
+    .tree-toggle > span:first-child { flex: 1; text-align: left; margin-left: 7px; }
+    .tree-count { color: var(--muted); font-size: 11px; }
+    .main-tree-view { position: absolute; inset: 0; z-index: 6; overflow: auto; padding: 18px; background: var(--bg); }
+    .main-tree-view[hidden] { display: none; }
+    .main-tree-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+    .main-conversation-tree { position: relative; min-width: 260px; }
+    .main-tree-connectors { position: absolute; inset: 0; z-index: 0; overflow: visible; pointer-events: none; }
+    .main-tree-edge { fill: none; stroke: var(--border); stroke-width: 1.5; stroke-linecap: round; }
+    .main-tree-family { position: relative; z-index: 1; min-width: 260px; }
+    .main-tree-node-row { position: relative; display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 10px; align-items: start; }
+    .main-tree-dot { position: relative; z-index: 2; box-sizing: border-box; width: 12px; height: 12px; margin: 16px 0 0 3px; border: 2px solid var(--muted); border-radius: 50%; background: var(--bg); }
+    .main-tree-dot.active { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .main-tree-node { display: block; width: min(100%, 760px); margin: 0; padding: 8px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+    .main-tree-node:hover, .main-tree-node.active { background: var(--accent-soft); }
+    .main-tree-node.active { color: var(--accent); }
+    .main-tree-node-task { display: block; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .main-tree-node-meta { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+    .main-tree-children { position: relative; }
+    .main-tree-children.branched { padding-left: 32px; }
+    .card.user.tree-highlight { box-shadow: 0 0 0 3px var(--accent-soft), 0 0 0 1px var(--accent); }
+
+    .context-menu { position: fixed; z-index: 10000; min-width: 190px; padding: 6px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); box-shadow: 0 12px 36px rgb(0 0 0 / 22%); }
+    .context-menu[hidden] { display: none; }
+    .context-menu button { display: block; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
+    .context-menu button:hover:not(:disabled) { background: var(--accent-soft); }
+    .context-menu button.danger { color: var(--err); }
+    .context-menu button:disabled { color: var(--muted); cursor: not-allowed; }
+    .conversation-item.pinned .conversation-title::before { content: "★ "; color: var(--accent); }
+    .card.user.editing { align-self: stretch; width: 100%; max-width: 100%; padding: 8px; }
+    .user-editor { display: grid; gap: 6px; width: 100%; min-width: 0; }
+    .user-editor textarea { width: 100%; min-height: 64px; max-height: 320px; resize: vertical; padding: 9px; border: 1px solid var(--accent); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+    .user-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }
+    .user-editor-actions button { padding: 6px 10px; }
+    body.activity-expanded aside.details .tree-panel { display: none; }
     .stats h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; }
     .stat { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
     .stat:last-child { border-bottom: 0; }
-    .stat span:last-child { font-variant-numeric: tabular-nums; font-weight: 600; }
+    .stat > span:first-child { flex: 0 0 auto; }
+    .stat > span:last-child { min-width: 0; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 600; }
 
     /* Activity: a compact, turn-aware ledger modelled after the DSH trajectory view. */
     .activity {
@@ -1470,7 +1497,52 @@ _HTML = r"""<!doctype html>
       padding: 13px 14px 10px;
       border-bottom: 1px solid var(--border);
     }
-    .activity-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .activity-heading {
+      --status-color: var(--accent);
+      position: relative;
+      isolation: isolate;
+      overflow: hidden;
+      padding: 4px 8px;
+      border-radius: 12px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+      align-items: center;
+      gap: 10px;
+    }
+    .activity-heading::before,
+    .activity-heading::after {
+      content: "";
+      position: absolute;
+      pointer-events: none;
+      -webkit-mask-image: linear-gradient(180deg, #000 0%, transparent 100%);
+      mask-image: linear-gradient(180deg, #000 0%, transparent 100%);
+    }
+    .activity-heading::before {
+      inset: 0;
+      z-index: -2;
+      border-radius: inherit;
+      background:
+        radial-gradient(ellipse 38% 100% at 18% 30%, color-mix(in srgb, var(--status-color) 65%, transparent), transparent 72%),
+        radial-gradient(ellipse 42% 100% at 72% 65%, color-mix(in srgb, var(--accent) 45%, transparent), transparent 75%),
+        linear-gradient(90deg, transparent, color-mix(in srgb, var(--status-color) 30%, transparent) 25%, color-mix(in srgb, var(--status-color) 38%, transparent) 60%, transparent);
+      background-size: 140% 100%, 160% 100%, 220% 100%;
+    }
+    .activity-heading::after {
+      inset: 0;
+      z-index: -1;
+      border-radius: inherit;
+      background: linear-gradient(105deg, transparent 25%, rgb(255 255 255 / 18%) 42%, transparent 58%);
+      background-size: 220% 100%;
+    }
+    .activity-heading[data-status="running"]::before { animation: silk-flow 5s ease-in-out infinite alternate; }
+    .activity-heading[data-status="running"]::after { animation: silk-sheen 5s ease-in-out infinite alternate; }
+    .activity-heading[data-status="error"], .activity-heading[data-status="failed"] { --status-color: var(--err); }
+    .activity-heading[data-status="submitted"] { --status-color: var(--ok); }
+    .activity-heading[data-status="stopped"] { --status-color: var(--muted); }
+    .activity-heading[data-status="interrupted"] { --status-color: var(--warn); }
+    @keyframes silk-flow { from { background-position: 0% 50%, 20% 50%, 0% 50%; } to { background-position: 100% 50%, 80% 50%, 100% 50%; } }
+    @keyframes silk-sheen { from { background-position: 0% 50%; } to { background-position: 100% 50%; } }
+    .activity-heading > .status { justify-self: center; white-space: nowrap; }
     .activity-heading h2 {
       margin: 0;
       color: var(--text);
@@ -1479,13 +1551,7 @@ _HTML = r"""<!doctype html>
       letter-spacing: 0.06em;
       text-transform: uppercase;
     }
-    .activity-subtitle {
-      margin: 3px 0 0;
-      color: var(--muted);
-      font-size: 11px;
-      line-height: 1.35;
-    }
-    .activity-heading-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+    .activity-heading-actions { flex: 0 0 auto; display: flex; align-items: center; justify-self: end; gap: 6px; }
     #activity-expand {
       flex: 0 0 auto;
       padding: 4px 8px;
@@ -1509,16 +1575,7 @@ _HTML = r"""<!doctype html>
       font-weight: 650;
       letter-spacing: 0.01em;
     }
-    .activity-summary::before {
-      content: "";
-      flex: 0 0 auto;
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--muted);
-    }
     .activity-summary.running { color: var(--accent); }
-    .activity-summary.running::before { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
     .activity-summary.done { color: var(--ok); }
     .activity-summary.done::before { background: var(--ok); }
     .activity-summary.error { color: var(--err); }
@@ -1527,43 +1584,28 @@ _HTML = r"""<!doctype html>
       display: flex;
       align-items: stretch;
       gap: 2px;
-      height: 9px;
-      padding: 2px;
+      width: 100%;
+      height: 10px;
+      min-height: 10px;
       overflow: hidden;
-      border-radius: 999px;
-      background: var(--bg);
     }
+    .activity-overview-track { display: flex; align-items: stretch; gap: 2px; height: 100%; flex-shrink: 0; will-change: transform; }
     .activity-segment {
-      flex: 1 1 0;
-      min-width: 2px;
-      max-width: 22px;
+      flex: 0 0 0;
+      min-width: 0;
       border-radius: 2px;
-      background: color-mix(in srgb, var(--accent) 75%, var(--panel));
+      background: var(--accent);
     }
-    .activity-segment.kind-tool { background: color-mix(in srgb, var(--warn) 78%, var(--panel)); }
-    .activity-segment.kind-done { background: var(--ok); }
-    .activity-segment.kind-error { background: var(--err); }
-    .activity-segment.kind-run { background: var(--accent); }
-    .activity-segment.kind-info { background: var(--muted); }
+    .activity-segment.kind-thinking { background: var(--accent); }
+    .activity-segment.kind-reply { background: var(--ok); }
+    .activity-segment.kind-tool { background: var(--warn); }
     .activity-overview-empty {
       flex: 1;
       color: var(--muted);
       font-size: 9px;
-      line-height: 5px;
+      line-height: 10px;
     }
-    .activity-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 3px 9px;
-      color: var(--muted);
-      font-size: 9px;
-      line-height: 1.25;
-    }
-    .activity-legend-item { display: inline-flex; align-items: center; gap: 4px; }
-    .activity-legend-dot { width: 6px; height: 6px; border-radius: 2px; background: var(--accent); }
-    .activity-legend-dot.tool { background: var(--warn); }
-    .activity-legend-dot.outcome { background: var(--ok); }
-    .activity-legend-dot.error { background: var(--err); }
+
     .activity-scroll {
       position: relative;
       flex: 1 1 auto;
@@ -1729,9 +1771,14 @@ _HTML = r"""<!doctype html>
       text-transform: uppercase;
     }
     .activity-output-text { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .activity-entry.activity-highlight {
-      border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
-      background: color-mix(in srgb, var(--accent-soft) 52%, transparent);
+    .activity-entry.activity-highlight .activity-card {
+      border-radius: 8px;
+      animation: activity-edge-flash 1100ms ease-out 1 both;
+    }
+    @keyframes activity-edge-flash {
+      0% { box-shadow: 0 0 0 0 transparent; background: transparent; }
+      18% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 72%, transparent); background: var(--accent-soft); }
+      100% { box-shadow: 0 0 0 0 transparent; background: transparent; }
     }
     .activity-meta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 5px; }
     .activity-status {
@@ -1755,7 +1802,7 @@ _HTML = r"""<!doctype html>
     .activity-entry.kind-done .activity-label { color: var(--ok); }
     /* Expanded activity page: the right rail takes over the conversation area. */
     body.activity-expanded main {
-      grid-template-columns: 250px minmax(0, 1fr);
+      grid-template-columns: 280px minmax(0, 1fr);
     }
     body.activity-expanded main > section { display: none; }
     body.activity-expanded aside.details {
@@ -1763,7 +1810,7 @@ _HTML = r"""<!doctype html>
       min-width: 0;
       overflow: hidden;
     }
-    body.activity-expanded aside.details .stats { display: none; }
+    body.activity-expanded aside.details .stats, body.activity-expanded .details-settings { display: none; }
     body.activity-expanded .activity {
       flex: 1 1 auto;
       min-height: 0;
@@ -1771,9 +1818,6 @@ _HTML = r"""<!doctype html>
     }
     body.activity-expanded .activity-header {
       padding: 16px 20px 12px;
-    }
-    body.activity-expanded .activity-subtitle {
-      max-width: 720px;
     }
     body.activity-expanded .activity-scroll {
       justify-content: flex-start;
@@ -1866,8 +1910,6 @@ _HTML = r"""<!doctype html>
       font-size: 11px;
     }
     body.activity-expanded .activity-meta-row { margin-top: 7px; }
-    body.activity-expanded .activity-overview { display: none; }
-    body.activity-expanded .activity-legend { display: none; }
     #activity-open { display: none; }
 
     @media (max-width: 1100px) {
@@ -1880,11 +1922,10 @@ _HTML = r"""<!doctype html>
     }
     @media (max-width: 700px) {
       main { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
-      aside.conversations { max-height: 180px; }
+      aside.conversations { position: relative; top: 0; height: auto; max-height: 180px; }
       body.activity-expanded main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); }
       body.activity-expanded aside.conversations { display: none; }
     }
-    .header-actions { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .settings-button {
       display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
       border: 1px solid var(--border); background: var(--panel); color: var(--text);
@@ -1898,24 +1939,17 @@ _HTML = r"""<!doctype html>
       clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important;
     }
     .model-switcher-control {
-      display: inline-flex; align-items: center; gap: 7px; min-width: 0;
+      display: inline-flex; align-items: center; gap: 0; min-width: 0;
       color: var(--muted); font-size: 12px; font-weight: 650;
     }
-    .model-switcher-control .model-switcher-label { white-space: nowrap; }
     #model-switcher {
-      max-width: min(380px, 38vw); min-width: 130px;
+      max-width: min(420px, 42vw); min-width: 130px;
       border: 1px solid var(--border); border-radius: 8px;
       background: var(--panel); color: var(--text);
       padding: 5px 26px 5px 9px; font: inherit; font-size: 12px;
       text-overflow: ellipsis; cursor: pointer;
     }
     #model-switcher:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-    .model-switcher-provider {
-      max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      padding: 3px 8px; border-radius: 999px; background: var(--accent-soft);
-      color: var(--accent); font-size: 11px; font-weight: 650;
-    }
-    .model-switcher-provider[hidden] { display: none; }
     .modal-backdrop {
       position: fixed; inset: 0; z-index: 100;
       display: grid; place-items: center; padding: 20px;
@@ -2024,7 +2058,6 @@ _HTML = r"""<!doctype html>
     .settings-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
     .settings-note { color: var(--muted); font-size: 12px; line-height: 1.7; }
     @media (max-width: 720px) {
-      .header-meta #database-path { display: none; }
       .settings-form { grid-template-columns: 1fr; }
       #model-switcher { max-width: 38vw; }
       .settings-row { align-items: flex-start; }
@@ -2033,18 +2066,7 @@ _HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <header>
-    <div class="brand"><span class="brand-mark">m</span><span>mini-SWE-agent</span></div>
-    <div class="header-actions">
-      <div class="header-meta">
-        <span id="database-path" title="SQLite conversation database path"></span>
-        <span id="model-label"></span>
-      </div>
-      <button id="settings-button" class="settings-button" type="button" aria-haspopup="dialog" aria-controls="settings-modal" title="Open settings">
-        <span class="gear" aria-hidden="true">&#9881;</span><span>Settings</span>
-      </button>
-    </div>
-  </header>
+
   <main>
     <aside class="panel conversations" aria-label="Conversations">
       <div class="conversations-head">
@@ -2056,7 +2078,6 @@ _HTML = r"""<!doctype html>
       </div>
     </aside>
     <section>
-      <span class="visually-hidden" id="status" role="status" aria-live="polite">idle</span>
       <div class="panel conversation-bar" aria-label="Conversation toolbar">
         <div class="conversation-context">
           <span class="conversation-label" id="conversation-label">New conversation</span>
@@ -2064,9 +2085,7 @@ _HTML = r"""<!doctype html>
         <div class="conversation-actions">
           <button id="activity-open" class="secondary" type="button" aria-controls="activity-panel" title="Open activity timeline">Activity</button>
           <label class="model-switcher-control" title="Switch the model for this conversation">
-            <span class="model-switcher-label">Model</span>
             <select id="model-switcher" aria-label="Switch model"></select>
-            <span class="model-switcher-provider" id="model-switcher-provider" title="Provider of the selected model" hidden></span>
           </label>
         </div>
       </div>
@@ -2074,6 +2093,11 @@ _HTML = r"""<!doctype html>
         <div class="feed" id="feed">
           <div class="panel empty" id="empty">Responses stream here as the agent works.</div>
         </div>
+        <div id="main-tree-view" class="main-tree-view" role="region" aria-label="Conversation branch tree" hidden>
+          <div class="main-tree-header"><strong>Conversation tree</strong><button id="main-tree-close" class="secondary" type="button">Back to conversation</button></div>
+          <div id="main-conversation-tree" class="main-conversation-tree"></div>
+        </div>
+
         <div class="scroll-actions">
           <button id="scroll-top" class="secondary" type="button" title="Go to top" aria-label="Go to top">↑ Go to top</button>
           <button id="scroll-bottom" class="secondary" type="button" title="Go to end" aria-label="Go to end">Go to end ↓</button>
@@ -2096,35 +2120,39 @@ _HTML = r"""<!doctype html>
       </div>
     </section>
     <aside class="details">
+      <div class="details-settings">
+        <button id="settings-button" class="settings-button" type="button" aria-haspopup="dialog" aria-controls="settings-modal" title="Open settings"><span class="gear" aria-hidden="true">&#9881;</span><span>Settings</span></button>
+      </div>
       <div class="panel stats">
         <h2>Run</h2>
         <div class="stat"><span>Step</span><span id="stat-step">-</span></div>
         <div class="stat"><span>Tool calls</span><span id="stat-tools">-</span></div>
         <div class="stat"><span>Cost</span><span id="stat-cost">$0.00</span></div>
         <div class="stat"><span>Tokens</span><span id="stat-tokens">-</span></div>
-        <div class="stat"><span>Input / output</span><span id="stat-token-detail">-</span></div>
-        <div class="stat"><span>Status</span><span id="stat-status">idle</span></div>
-        <div class="stat"><span>Exit</span><span id="stat-exit">-</span></div>
+        <div class="stat" title="Current context length after the latest model call"><span>Context</span><span id="stat-context">-</span></div>
+        <div class="stat"><span>Input</span><span id="stat-input">-</span></div>
+        <div class="stat"><span>Output</span><span id="stat-output">-</span></div>
       </div>
+      <section class="panel tree-panel" id="tree-panel">
+        <button id="tree-toggle" class="tree-toggle" type="button" aria-expanded="false" aria-controls="main-tree-view">
+          <span>Conversation tree</span><span id="tree-count" class="tree-count">0</span>
+        </button>
+      </section>
+
       <section class="panel activity" id="activity-panel" aria-label="Activity timeline">
         <div class="activity-header">
-          <div class="activity-heading">
+          <div class="activity-heading" data-status="idle">
             <div>
               <h2>Activity</h2>
-              <p class="activity-subtitle">Step-by-step trajectory of model calls, tool runs, and outcomes.</p>
             </div>
+            <span id="status" class="status" role="status" aria-live="polite">idle</span>
             <div class="activity-heading-actions">
               <button id="activity-expand" class="secondary" type="button" aria-controls="activity-panel" aria-expanded="false" title="Expand activity view">Expand</button>
             </div>
           </div>
           <div class="activity-summary" id="activity-summary" role="status" aria-live="polite">No activity yet</div>
           <div class="activity-overview" id="activity-overview" aria-label="Activity overview"></div>
-          <div class="activity-legend" aria-hidden="true">
-            <span class="activity-legend-item"><i class="activity-legend-dot"></i>Model step</span>
-            <span class="activity-legend-item"><i class="activity-legend-dot tool"></i>Tool run</span>
-            <span class="activity-legend-item"><i class="activity-legend-dot outcome"></i>Outcome</span>
-            <span class="activity-legend-item"><i class="activity-legend-dot error"></i>Error</span>
-          </div>
+
         </div>
         <div class="activity-scroll" id="activity-scroll">
           <ol id="activity-log">
@@ -2274,6 +2302,14 @@ _HTML = r"""<!doctype html>
       </div>
     </div>
   </div>
+  <div id="image-preview" class="image-preview" role="dialog" aria-modal="true" aria-label="Image preview" hidden>
+    <button id="image-preview-close" class="image-preview-close" type="button" aria-label="Close image preview">×</button>
+    <img id="image-preview-image" alt="Image preview">
+    <a id="image-preview-open" href="#" target="_blank" rel="noopener noreferrer">Open original</a>
+  </div>
+
+  <div id="context-menu" class="context-menu" role="menu" hidden></div>
+
   <script>
     const feed = document.getElementById("feed");
     const empty = document.getElementById("empty");
@@ -2290,9 +2326,9 @@ _HTML = r"""<!doctype html>
     const statStep = document.getElementById("stat-step");
     const statCost = document.getElementById("stat-cost");
     const statTokens = document.getElementById("stat-tokens");
-    const statTokenDetail = document.getElementById("stat-token-detail");
-    const statStatus = document.getElementById("stat-status");
-    const statExit = document.getElementById("stat-exit");
+    const statContext = document.getElementById("stat-context");
+    const statInput = document.getElementById("stat-input");
+    const statOutput = document.getElementById("stat-output");
     const statTools = document.getElementById("stat-tools");
     const activityLog = document.getElementById("activity-log");
     const activityEmpty = document.getElementById("activity-empty");
@@ -2302,14 +2338,22 @@ _HTML = r"""<!doctype html>
     const activityExpandButton = document.getElementById("activity-expand");
     const activityOpenButton = document.getElementById("activity-open");
     const conversationList = document.getElementById("conversation-list");
+    const treeToggle = document.getElementById("tree-toggle");
+    const treeCount = document.getElementById("tree-count");
+    const mainTreeView = document.getElementById("main-tree-view");
+    const mainConversationTree = document.getElementById("main-conversation-tree");
+    const mainTreeClose = document.getElementById("main-tree-close");
+    const contextMenu = document.getElementById("context-menu");
+    const imagePreview = document.getElementById("image-preview");
+    const imagePreviewImage = document.getElementById("image-preview-image");
+    const imagePreviewOpen = document.getElementById("image-preview-open");
+    const imagePreviewClose = document.getElementById("image-preview-close");
     const conversationEmpty = document.getElementById("conversation-empty");
     const CONVERSATION_STATES = ["running", "submitted", "stopped", "failed", "interrupted"];
     const newConversationButton = document.getElementById("new-conversation");
     const scrollTopButton = document.getElementById("scroll-top");
     const scrollBottomButton = document.getElementById("scroll-bottom");
     const modelSwitcher = document.getElementById("model-switcher");
-    const modelProviderBadge = document.getElementById("model-switcher-provider");
-    const modelLabel = document.getElementById("model-label");
     const settingsButton = document.getElementById("settings-button");
     const settingsModal = document.getElementById("settings-modal");
     const settingsCloseButton = document.getElementById("settings-close");
@@ -2332,8 +2376,13 @@ _HTML = r"""<!doctype html>
     let activeSessionId = null;
     let replayingHistory = false;
     let selectedSessionId = null;
+    let pendingTreeNavigation = null;
+    let conversationTreeEdges = [];
+    let conversationTreeDots = new Map();
+    let conversationTreeEdgesFrame = null;
     let conversations = [];
     let defaultWorkspace = "";
+    let databasePath = "";
     let currentAssistant = null;
     let currentReasoning = null;
     let pendingImages = [];
@@ -2341,6 +2390,10 @@ _HTML = r"""<!doctype html>
     const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
     let followOutput = true;
     let currentTokenUsage = { prompt: 0, completion: 0, total: 0 };
+    // Conversation totals: `completedTokenUsage` sums finished turns, `runTokenUsage`
+    // tracks the model calls of the turn that is currently running.
+    let completedTokenUsage = { prompt: 0, completion: 0, total: 0 };
+    let runTokenUsage = { prompt: 0, completion: 0, total: 0 };
     let guiSettings = { providers: [], models: [], enabled_models: [], active_model: "" };
     let currentSettingsTab = "general";
     let editingProviderId = "";
@@ -2353,6 +2406,7 @@ _HTML = r"""<!doctype html>
     let pendingAssistantMessage = null;
     let activityTimer = null;
     let activityLayoutFrame = null;
+    let activityOverviewFrame = null;
     let activityFollowOutput = true;
     let currentActivityStep = null;
     let currentActivityStepNumber = null;
@@ -2384,9 +2438,21 @@ _HTML = r"""<!doctype html>
       const completionTokens = numeric(completion);
       const totalTokens = numeric(total) || promptTokens + completionTokens;
       statTokens.textContent = totalTokens ? formatTokens(totalTokens) : "-";
-      statTokenDetail.textContent = totalTokens
-        ? formatTokens(promptTokens) + " in / " + formatTokens(completionTokens) + " out"
-        : "-";
+      statInput.textContent = totalTokens ? formatTokens(promptTokens) : "-";
+      statOutput.textContent = totalTokens ? formatTokens(completionTokens) : "-";
+    }
+
+    function contextLengthFromAssistant(event, prompt, completion) {
+      const usage = event.usage || {};
+      return numeric(event.total_tokens ?? event.tokens ?? usage.total_tokens) || numeric(prompt) + numeric(completion);
+    }
+
+    function setContextStats(total, prompt = 0, completion = 0) {
+      const contextTokens = numeric(total);
+      statContext.textContent = contextTokens ? formatTokens(contextTokens) : '-';
+      statContext.title = contextTokens
+        ? formatTokens(contextTokens) + ' tokens after the latest model call (' + formatTokens(prompt) + ' in / ' + formatTokens(completion) + ' out)'
+        : 'Current context length after the latest model call';
     }
 
     function setTokenStatsFromConversation(conversation) {
@@ -2396,55 +2462,78 @@ _HTML = r"""<!doctype html>
         completion: numeric(conversation && (conversation.total_completion_tokens ?? conversation.completion_tokens ?? usage.completion_tokens)),
         total: numeric(conversation && (conversation.total_tokens_used ?? conversation.total_tokens ?? conversation.tokens ?? usage.total_tokens)),
       };
+      completedTokenUsage = { ...currentTokenUsage };
+      runTokenUsage = { prompt: 0, completion: 0, total: 0 };
       setTokenStats(currentTokenUsage.prompt, currentTokenUsage.completion, currentTokenUsage.total);
+      setContextStats(conversation && conversation.context_tokens);
     }
 
     function updateTokenStatsFromAssistant(event) {
       const usage = event.usage || {};
       const callPrompt = numeric(event.prompt_tokens ?? usage.prompt_tokens);
       const callCompletion = numeric(event.completion_tokens ?? usage.completion_tokens);
-      const callTotal = numeric(event.total_tokens ?? event.tokens ?? usage.total_tokens) || callPrompt + callCompletion;
-      if (event.cumulative_usage) {
-        const prompt = numeric(event.cumulative_usage.prompt_tokens);
-        const completion = numeric(event.cumulative_usage.completion_tokens);
-        currentTokenUsage = {
-          prompt,
-          completion,
-          total: numeric(event.cumulative_usage.total_tokens) || prompt + completion,
-        };
-      } else if (event.total_tokens_used !== undefined) {
-        const prompt = numeric(event.total_prompt_tokens);
-        const completion = numeric(event.total_completion_tokens);
-        currentTokenUsage = {
-          prompt,
-          completion,
-          total: numeric(event.total_tokens_used) || prompt + completion,
-        };
-      } else {
-        currentTokenUsage.prompt += callPrompt;
-        currentTokenUsage.completion += callCompletion;
-        currentTokenUsage.total += callTotal;
+      const callTotal = contextLengthFromAssistant(event, callPrompt, callCompletion);
+      if (!replayingHistory) {
+        const conversationUsage = event.conversation_usage;
+        if (conversationUsage) {
+          currentTokenUsage = {
+            prompt: numeric(conversationUsage.prompt_tokens),
+            completion: numeric(conversationUsage.completion_tokens),
+            total: numeric(conversationUsage.total_tokens),
+          };
+        } else if (event.cumulative_usage) {
+          const prompt = numeric(event.cumulative_usage.prompt_tokens);
+          const completion = numeric(event.cumulative_usage.completion_tokens);
+          const total = numeric(event.cumulative_usage.total_tokens) || prompt + completion;
+          currentTokenUsage = {
+            prompt: completedTokenUsage.prompt + prompt,
+            completion: completedTokenUsage.completion + completion,
+            total: completedTokenUsage.total + total,
+          };
+        } else {
+          runTokenUsage.prompt += callPrompt;
+          runTokenUsage.completion += callCompletion;
+          runTokenUsage.total += callTotal;
+          currentTokenUsage = {
+            prompt: completedTokenUsage.prompt + runTokenUsage.prompt,
+            completion: completedTokenUsage.completion + runTokenUsage.completion,
+            total: completedTokenUsage.total + runTokenUsage.total,
+          };
+        }
+        setTokenStats(currentTokenUsage.prompt, currentTokenUsage.completion, currentTokenUsage.total);
       }
-      setTokenStats(currentTokenUsage.prompt, currentTokenUsage.completion, currentTokenUsage.total);
+      setContextStats(callTotal, callPrompt, callCompletion);
       return callTotal;
     }
 
     function updateTokenStatsFromDone(event) {
+      const conversationUsage = event.conversation_usage;
       const usage = event.token_usage || event.cumulative_usage || event.usage || {};
-      const prompt = numeric(event.total_prompt_tokens ?? event.prompt_tokens ?? usage.prompt_tokens ?? currentTokenUsage.prompt);
-      const completion = numeric(event.total_completion_tokens ?? event.completion_tokens ?? usage.completion_tokens ?? currentTokenUsage.completion);
-      currentTokenUsage = {
-        prompt,
-        completion,
-        total: numeric(event.total_tokens_used ?? event.total_tokens ?? event.tokens ?? usage.total_tokens) || prompt + completion,
-      };
+      if (conversationUsage) {
+        completedTokenUsage = {
+          prompt: numeric(conversationUsage.prompt_tokens),
+          completion: numeric(conversationUsage.completion_tokens),
+          total: numeric(conversationUsage.total_tokens),
+        };
+      } else {
+        const prompt = numeric(event.total_prompt_tokens ?? event.prompt_tokens ?? usage.prompt_tokens);
+        const completion = numeric(event.total_completion_tokens ?? event.completion_tokens ?? usage.completion_tokens);
+        const total = numeric(event.total_tokens_used ?? event.total_tokens ?? event.tokens ?? usage.total_tokens) || prompt + completion;
+        completedTokenUsage = {
+          prompt: completedTokenUsage.prompt + prompt,
+          completion: completedTokenUsage.completion + completion,
+          total: completedTokenUsage.total + total,
+        };
+      }
+      runTokenUsage = { prompt: 0, completion: 0, total: 0 };
+      currentTokenUsage = { ...completedTokenUsage };
       setTokenStats(currentTokenUsage.prompt, currentTokenUsage.completion, currentTokenUsage.total);
     }
 
     function setStatus(text, state = "") {
       statusEl.textContent = text;
       statusEl.className = "status " + state;
-      statStatus.textContent = text;
+      statusEl.parentElement.dataset.status = state || "idle";
     }
 
     async function apiRequest(url, options = {}) {
@@ -2501,9 +2590,6 @@ _HTML = r"""<!doctype html>
         option.disabled = true;
         modelSwitcher.appendChild(option);
         modelSwitcher.value = "";
-        modelProviderBadge.textContent = "";
-        modelProviderBadge.hidden = true;
-        modelLabel.textContent = "default model";
         return;
       }
       for (const model of enabled) {
@@ -2517,11 +2603,6 @@ _HTML = r"""<!doctype html>
       const active = String(guiSettings.active_model || "");
       const selected = previous && known.has(previous) ? previous : (known.has(active) ? active : modelNameOf(enabled[0]));
       modelSwitcher.value = selected;
-      const selectedModel = enabled.find((model) => modelNameOf(model) === selected) || enabled[0];
-      modelLabel.textContent = modelOptionLabel(selectedModel) || selected;
-      const selectedProvider = modelProviderName(selectedModel);
-      modelProviderBadge.textContent = selectedProvider;
-      modelProviderBadge.hidden = !selectedProvider;
     }
 
     function renderProviderOptions(selected) {
@@ -2656,7 +2737,7 @@ _HTML = r"""<!doctype html>
       const activeModel = String(guiSettings.active_model || "");
       document.getElementById("settings-active-model").textContent = activeModel || "Not configured";
       document.getElementById("settings-workspace").textContent = defaultWorkspace || "-";
-      const databaseText = document.getElementById("database-path").textContent || "-";
+      const databaseText = databasePath || "-";
       document.getElementById("settings-database").textContent = databaseText;
 
       providersList.textContent = "";
@@ -3198,6 +3279,7 @@ _HTML = r"""<!doctype html>
       const entries = Array.from(activityLog.querySelectorAll(".activity-entry"));
       if (!entries.length) {
         setActivitySpineState(false, false);
+        drawActivityOverview();
         return;
       }
       if (!activityIsExpanded()) {
@@ -3232,6 +3314,7 @@ _HTML = r"""<!doctype html>
           const duration = entry.querySelector(".activity-duration");
           if (duration) duration.hidden = true;
         });
+        drawActivityOverview();
         return;
       }
 
@@ -3251,6 +3334,7 @@ _HTML = r"""<!doctype html>
         const label = entry.querySelector(".activity-label");
         entry.title = (label ? label.textContent : "Activity") + " · " + formatActivityDuration(duration);
       });
+      drawActivityOverview();
     }
 
     function setActivityExpanded(expanded) {
@@ -3268,26 +3352,110 @@ _HTML = r"""<!doctype html>
       if (event.key === "Escape" && activityIsExpanded()) setActivityExpanded(false);
     });
     activityScroller.addEventListener("scroll", () => {
-      if (activityIsExpanded()) activityFollowOutput = activityIsNearBottom();
+      if (activityIsExpanded()) {
+        activityFollowOutput = activityIsNearBottom();
+        scheduleActivityOverview();
+      }
     }, { passive: true });
     window.addEventListener("resize", scheduleActivityLayout, { passive: true });
 
+    function activityEventTime(event) {
+      const timestamp = Number(event.timestamp || 0);
+      return timestamp > 0 ? (timestamp < 1e12 ? timestamp * 1000 : timestamp) : Date.now();
+    }
+
+    function beginActivityPhase(entry, kind, timestamp) {
+      if (!entry) return;
+      const startedAt = Number(timestamp) || Date.now();
+      const phases = entry._activityPhases || (entry._activityPhases = []);
+      const current = phases[phases.length - 1];
+      if (current && !current.endedAt) {
+        if (current.kind === kind) return;
+        current.endedAt = startedAt;
+      }
+      if (!phases.length) entry.dataset.startedAt = String(startedAt);
+      delete entry.dataset.endedAt;
+      phases.push({ kind, startedAt, endedAt: 0 });
+      drawActivityOverview();
+    }
+
+    function endActivityPhase(entry, timestamp) {
+      if (!entry) return;
+      const phases = entry._activityPhases || [];
+      const current = phases[phases.length - 1];
+      if (!current || current.endedAt) return;
+      current.endedAt = Number(timestamp) || Date.now();
+      entry.dataset.endedAt = String(current.endedAt);
+      drawActivityOverview();
+    }
+
+    function activityPhaseSegments(entries, now = Date.now()) {
+      const segments = [];
+      for (const entry of entries) {
+        if (entry.hidden) continue;
+        for (const phase of entry._activityPhases || []) {
+          const duration = Math.max(0, Number(phase.endedAt || now) - Number(phase.startedAt));
+          if (!duration) continue;
+          segments.push({
+            kind: phase.kind,
+            label: entry._activityTitle || 'Activity',
+            duration,
+          });
+        }
+      }
+      return segments;
+    }
+
+    function activityEntriesInView() {
+      const entries = Array.from(activityLog.querySelectorAll('.activity-entry')).filter((entry) => !entry.hidden);
+      if (!activityIsExpanded()) return entries;
+      const viewport = activityScroller.getBoundingClientRect();
+      return entries.filter((entry) => {
+        const rect = entry.getBoundingClientRect();
+        return rect.bottom > viewport.top && rect.top < viewport.bottom;
+      });
+    }
+
+    function syncActivityOverviewScroll() {
+      const track = activityOverview.querySelector('.activity-overview-track');
+      if (!track) return;
+      const width = activityOverview.clientWidth;
+      const travel = activityIsExpanded() ? Math.min(96, width * 0.22) : 0;
+      const scrollRange = Math.max(0, activityScroller.scrollHeight - activityScroller.clientHeight);
+      const progress = scrollRange ? Math.max(0, Math.min(1, activityScroller.scrollTop / scrollRange)) : 0;
+      track.style.width = width + travel + 'px';
+      track.style.transform = 'translateX(' + (-progress * travel) + 'px)';
+    }
+
+    function scheduleActivityOverview() {
+      if (activityOverviewFrame !== null) return;
+      activityOverviewFrame = requestAnimationFrame(() => {
+        activityOverviewFrame = null;
+        drawActivityOverview();
+      });
+    }
+
     function drawActivityOverview() {
       activityOverview.replaceChildren();
-      const segments = activityState.segments.slice(-64);
+      const segments = activityPhaseSegments(activityEntriesInView());
       if (!segments.length) {
-        const empty = document.createElement("span");
-        empty.className = "activity-overview-empty";
-        empty.textContent = "Timeline appears here";
+        const empty = document.createElement('span');
+        empty.className = 'activity-overview-empty';
+        empty.textContent = 'Timeline appears here';
         activityOverview.appendChild(empty);
         return;
       }
-      segments.forEach((segment) => {
-        const bar = document.createElement("span");
-        bar.className = "activity-segment kind-" + segment.kind;
-        bar.title = segment.label + " · " + segment.time;
-        activityOverview.appendChild(bar);
-      });
+      const track = document.createElement('div');
+      track.className = 'activity-overview-track';
+      for (const segment of segments) {
+        const bar = document.createElement('span');
+        bar.className = 'activity-segment kind-' + segment.kind;
+        bar.style.flexGrow = String(segment.duration);
+        bar.title = segment.label + ' · ' + segment.kind + ' · ' + formatActivityDuration(segment.duration);
+        track.appendChild(bar);
+      }
+      activityOverview.appendChild(track);
+      syncActivityOverviewScroll();
     }
 
     function updateActivitySummary() {
@@ -3309,17 +3477,13 @@ _HTML = r"""<!doctype html>
       statTools.textContent = activityState.tools ? String(activityState.tools) : "-";
     }
 
-    function addActivitySegment(kind, label, time = formatClock()) {
-      activityState.segments.push({ kind, label, time });
-      if (activityState.segments.length > 96) activityState.segments.shift();
-      drawActivityOverview();
-    }
-
     function addActivityEntry(kind, title, options = {}) {
       activityEmpty.hidden = true;
       finalizeOpenActivities();
       const entry = document.createElement("li");
       entry.className = "activity-entry kind-" + kind;
+      entry._activityPhases = [];
+      entry._activityTitle = title;
       entry.dataset.startedAt = String(Date.now());
       if (options.status) entry.dataset.status = String(options.status).toLowerCase();
 
@@ -3369,7 +3533,6 @@ _HTML = r"""<!doctype html>
       if (options.status) updateActivityEntry(entry, { status: options.status, meta: options.meta });
       else if (options.meta) updateActivityEntry(entry, { meta: options.meta });
       if (options.output) updateActivityEntry(entry, { output: options.output });
-      if (options.segment !== false) addActivitySegment(kind, title, time.textContent);
       updateActivitySummary();
       scheduleActivityLayout();
       return entry;
@@ -3381,7 +3544,10 @@ _HTML = r"""<!doctype html>
       const copy = entry.querySelector(".activity-copy");
       const status = entry.querySelector(".activity-status");
       const meta = entry.querySelector(".activity-meta");
-      if (options.title !== undefined && label) label.textContent = options.title;
+      if (options.title !== undefined) {
+        entry._activityTitle = String(options.title);
+        if (label) label.textContent = options.title;
+      }
       if (options.detail !== undefined && copy) copy.textContent = options.detail;
       if (options.command !== undefined && copy) {
         const fullCommand = "$ " + String(options.command || "");
@@ -3443,6 +3609,7 @@ _HTML = r"""<!doctype html>
       activityTimer = setInterval(() => {
         if (!activityState.finishedAt) {
           updateActivitySummary();
+          drawActivityOverview();
           scheduleActivityLayout();
         }
       }, 1000);
@@ -3529,7 +3696,8 @@ _HTML = r"""<!doctype html>
         status: "running",
         meta: currentActivityStepNumber ? "step " + currentActivityStepNumber : "",
       });
-      entry.dataset.startedAt = String(Date.now());
+      entry.dataset.startedAt = String(activityEventTime(event));
+      beginActivityPhase(entry, "tool", activityEventTime(event));
       if (toolCallId) {
         entry.dataset.toolCallId = toolCallId;
         activityToolEntries.set(toolCallId, entry);
@@ -3556,8 +3724,11 @@ _HTML = r"""<!doctype html>
       const failed = returncode != null && Number(returncode) !== 0;
       const status = returncode == null ? "finished" : "exit " + returncode;
       const output = String(event.output || "");
+      const endedAt = activityEventTime(event);
+      endActivityPhase(entry, endedAt);
+      entry.dataset.endedAt = String(endedAt);
       const startedAt = Number(entry.dataset.startedAt || 0);
-      const elapsed = startedAt ? Date.now() - startedAt : 0;
+      const elapsed = startedAt ? endedAt - startedAt : 0;
       const timing = elapsed >= 100 ? " · " + formatElapsed(elapsed) : "";
       const meta = "exit " + (returncode ?? "?") + timing + " · " + formatTokens(output.length) + " chars";
       // Store the complete result on the activity entry.  CSS hides it in the
@@ -3571,6 +3742,8 @@ _HTML = r"""<!doctype html>
 
     function finalizeActivity(event) {
       const exitStatus = event.exit_status || "done";
+      activityStepEntries.forEach((entry) => endActivityPhase(entry, activityEventTime(event)));
+      activityToolEntries.forEach((entry) => endActivityPhase(entry, activityEventTime(event)));
       const successful = exitStatus === "Submitted";
       const stopped = exitStatus === "Stopped";
       const withError = !successful && !stopped;
@@ -3589,14 +3762,14 @@ _HTML = r"""<!doctype html>
       ].filter(Boolean).join(" · ");
       const detail = event.submission
         ? "Submission: " + previewText(event.submission, 180)
-        : "Exit status: " + exitStatus;
+        : (event.message ? previewText(event.message, 180) : "Exit status: " + exitStatus);
       addActivityEntry(withError ? "error" : "done", "Run finished · " + exitStatus, {
         marker: successful ? "✓" : stopped ? "■" : "!",
         detail,
         status: successful ? "submitted" : stopped ? "stopped" : "failed",
         meta,
       });
-      finalizeOpenActivities();
+      finalizeOpenActivities(activityEventTime(event));
       markActivityFinished(withError);
       scheduleActivityLayout();
     }
@@ -3635,6 +3808,32 @@ _HTML = r"""<!doctype html>
       return (first || "(empty command)") + (remaining ? "  +" + remaining + " more line" + (remaining === 1 ? "" : "s") : "");
     }
 
+    function flashActivityEntry(entry) {
+      entry.classList.remove('activity-highlight');
+      void entry.offsetWidth;
+      entry.classList.add('activity-highlight');
+      entry.addEventListener('animationend', () => entry.classList.remove('activity-highlight'), { once: true });
+    }
+
+    function flashActivityEntryWhenSettled(entry) {
+      const startedAt = performance.now();
+      let previousScrollTop = activityScroller.scrollTop;
+      let stableFrames = 0;
+      function waitForScrollToSettle() {
+        if (!entry.isConnected) return;
+        const scrollTop = activityScroller.scrollTop;
+        const elapsed = performance.now() - startedAt;
+        stableFrames = Math.abs(scrollTop - previousScrollTop) < 1 ? stableFrames + 1 : 0;
+        previousScrollTop = scrollTop;
+        if ((stableFrames >= 4 && elapsed >= 100) || elapsed >= 2500) {
+          flashActivityEntry(entry);
+          return;
+        }
+        requestAnimationFrame(waitForScrollToSettle);
+      }
+      requestAnimationFrame(waitForScrollToSettle);
+    }
+
     function openToolActivity(toolCallId) {
       setActivityExpanded(true);
       const entry = toolCallId ? activityToolEntries.get(String(toolCallId)) : null;
@@ -3644,8 +3843,7 @@ _HTML = r"""<!doctype html>
       requestAnimationFrame(() => requestAnimationFrame(() => {
         entry.hidden = false;
         entry.scrollIntoView({ block: "center", behavior: "smooth" });
-        entry.classList.add("activity-highlight");
-        setTimeout(() => entry.classList.remove("activity-highlight"), 1800);
+        flashActivityEntryWhenSettled(entry);
       }));
     }
 
@@ -3714,7 +3912,7 @@ _HTML = r"""<!doctype html>
         // Assistant text is part of the transcript, not a widget.  Model
         // metadata (step, cost, tokens) is kept in the Activity ledger.
         card.setAttribute("aria-label", role || "Agent");
-      } else {
+      } else if (kind !== "user") {
         const head = document.createElement("div");
         head.className = "card-head";
         const label = document.createElement("span");
@@ -3904,8 +4102,109 @@ _HTML = r"""<!doctype html>
       return content;
     }
 
+    function beginUserEdit(card) {
+      if (card.querySelector('.user-editor')) return;
+      const sourceId = selectedSessionId;
+      const conversation = conversations.find((item) => conversationId(item) === sourceId);
+      if (!sourceId || !conversation || !conversation.done) {
+        window.alert('Wait for this conversation to finish before creating a branch.');
+        return;
+      }
+      const content = card.querySelector('.content');
+      const original = markdownSource(content);
+      const gallery = card.querySelector('.card-images');
+      card.classList.add('editing');
+      content.hidden = true;
+      if (gallery) gallery.hidden = true;
+      const editor = document.createElement('div');
+      editor.className = 'user-editor';
+      const textarea = document.createElement('textarea');
+      textarea.value = original;
+      textarea.setAttribute('aria-label', 'Edit user message for a new branch');
+      const actions = document.createElement('div');
+      actions.className = 'user-editor-actions';
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'secondary';
+      cancel.textContent = 'Cancel';
+      const confirm = document.createElement('button');
+      confirm.type = 'button';
+      confirm.textContent = 'Create branch';
+      actions.append(cancel, confirm);
+      editor.append(textarea, actions);
+      card.appendChild(editor);
+      function resizeEditor() {
+        textarea.style.height = 'auto';
+        textarea.style.height = Math.min(Math.max(textarea.scrollHeight, 64), 320) + 'px';
+      }
+      textarea.addEventListener('input', resizeEditor);
+      requestAnimationFrame(resizeEditor);
+      textarea.addEventListener('contextmenu', (event) => event.stopPropagation());
+      function closeEditor() {
+        editor.remove();
+        card.classList.remove('editing');
+        content.hidden = false;
+        if (gallery) gallery.hidden = false;
+      }
+      async function createBranch() {
+        const task = textarea.value.trim();
+        if (!task) {
+          textarea.focus();
+          return;
+        }
+        if (task === original.trim()) {
+          closeEditor();
+          return;
+        }
+        confirm.disabled = true;
+        cancel.disabled = true;
+        setStatus('creating branch', 'running');
+        try {
+          const data = await conversationRequest(
+            '/api/conversations/' + encodeURIComponent(sourceId) + '/branch',
+            {
+              method: 'POST',
+              body: JSON.stringify({ task, turn_index: Number(card.dataset.turnIndex) }),
+            },
+          );
+          await loadConversations();
+          await selectConversation(data.session_id);
+        } catch (err) {
+          confirm.disabled = false;
+          cancel.disabled = false;
+          setStatus('branch failed', 'error');
+          window.alert(String(err.message || err));
+        }
+      }
+      cancel.addEventListener('click', closeEditor);
+      confirm.addEventListener('click', createBranch);
+      textarea.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          closeEditor();
+        } else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault();
+          createBranch();
+        }
+      });
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+
     function addUserCard(task, images) {
-      const card = makeCard("user", "Task");
+      const card = makeCard("user", "");
+      card.setAttribute("aria-label", "Your message");
+      card.dataset.turnIndex = String(feed.querySelectorAll(".card.user").length - 1);
+      card.title = "Right-click to edit and create a branch";
+      card.addEventListener("contextmenu", (event) => {
+        const conversation = conversations.find((item) => conversationId(item) === selectedSessionId);
+        openContextMenu(event, [{
+          label: "Edit and create branch",
+          disabled: !conversation || !conversation.done,
+          action: () => beginUserEdit(card),
+        }]);
+      });
       appendText(card, task);
       const imageUrls = Array.isArray(images) ? images.filter(Boolean) : [];
       if (imageUrls.length) {
@@ -3916,6 +4215,11 @@ _HTML = r"""<!doctype html>
           link.href = String(url);
           link.target = "_blank";
           link.rel = "noopener noreferrer";
+          link.title = "Click to preview image";
+          link.addEventListener("click", (event) => {
+            event.preventDefault();
+            openImagePreview(url);
+          });
           const img = document.createElement("img");
           img.src = String(url);
           img.alt = "Attached image";
@@ -3923,6 +4227,12 @@ _HTML = r"""<!doctype html>
           gallery.appendChild(link);
         });
         card.appendChild(gallery);
+      }
+      if (pendingTreeNavigation
+        && pendingTreeNavigation.sessionId === selectedSessionId
+        && pendingTreeNavigation.turnIndex === Number(card.dataset.turnIndex)) {
+        pendingTreeNavigation = null;
+        requestAnimationFrame(() => highlightUserCard(card));
       }
       return card;
     }
@@ -4238,6 +4548,310 @@ _HTML = r"""<!doctype html>
       return new Date(Number(timestamp) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     }
 
+    function closeImagePreview() {
+      imagePreview.hidden = true;
+      imagePreviewImage.src = '';
+      document.body.classList.remove('preview-open');
+    }
+
+    function openImagePreview(url) {
+      closeContextMenu();
+      imagePreviewImage.src = String(url);
+      imagePreviewOpen.href = String(url);
+      imagePreview.hidden = false;
+      document.body.classList.add('preview-open');
+      imagePreviewClose.focus();
+    }
+
+    imagePreviewClose.addEventListener('click', closeImagePreview);
+    imagePreview.addEventListener('click', (event) => {
+      if (event.target === imagePreview) closeImagePreview();
+    });
+
+    function closeContextMenu() {
+      contextMenu.hidden = true;
+      contextMenu.replaceChildren();
+    }
+
+    function openContextMenu(event, items) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeContextMenu();
+      for (const item of items) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.role = 'menuitem';
+        button.textContent = item.label;
+        button.disabled = Boolean(item.disabled);
+        if (item.danger) button.className = 'danger';
+        button.addEventListener('click', () => {
+          closeContextMenu();
+          Promise.resolve(item.action()).catch((err) => window.alert(String(err.message || err)));
+        });
+        contextMenu.appendChild(button);
+      }
+      contextMenu.hidden = false;
+      contextMenu.style.left = Math.max(8, Math.min(event.clientX, window.innerWidth - contextMenu.offsetWidth - 8)) + 'px';
+      contextMenu.style.top = Math.max(8, Math.min(event.clientY, window.innerHeight - contextMenu.offsetHeight - 8)) + 'px';
+    }
+
+    document.addEventListener('click', closeContextMenu);
+    document.addEventListener('contextmenu', closeContextMenu);
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeContextMenu();
+        closeImagePreview();
+      }
+    });
+    window.addEventListener('resize', closeContextMenu);
+    window.addEventListener('blur', closeContextMenu);
+
+    async function conversationRequest(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+      return data;
+    }
+
+    async function updateConversationMetadata(id, changes) {
+      const data = await conversationRequest('/api/conversations/' + encodeURIComponent(id), {
+        method: 'PATCH',
+        body: JSON.stringify(changes),
+      });
+      const conversation = conversations.find((item) => conversationId(item) === id);
+      if (conversation) Object.assign(conversation, data.conversation);
+      if (id === selectedSessionId) {
+        conversationLabel.textContent = (data.conversation && data.conversation.title) || 'Untitled conversation';
+      }
+      renderConversationList();
+      if ('pinned' in changes) await loadConversations();
+    }
+
+    function showConversationContextMenu(event, id) {
+      const conversation = conversations.find((item) => conversationId(item) === id);
+      if (!conversation) return;
+      openContextMenu(event, [
+        {
+          label: 'Rename',
+          action: async () => {
+            const title = window.prompt('Rename conversation', conversation.title || conversation.task || '');
+            if (title !== null && title.trim()) await updateConversationMetadata(id, { title: title.trim() });
+          },
+        },
+        {
+          label: conversation.pinned ? 'Unpin' : 'Pin to top',
+          action: () => updateConversationMetadata(id, { pinned: !conversation.pinned }),
+        },
+        {
+          label: 'Delete',
+          danger: true,
+          action: async () => {
+            if (!window.confirm('Delete this conversation? Child branches will be kept.')) return;
+            await conversationRequest('/api/conversations/' + encodeURIComponent(id), { method: 'DELETE' });
+            if (id === selectedSessionId) startNewConversation();
+            await loadConversations();
+          },
+        },
+      ]);
+    }
+
+    function currentConversationTree() {
+      const byId = new Map(conversations.map((conversation) => [conversationId(conversation), conversation]));
+      let root = byId.get(selectedSessionId);
+      if (!root) return { roots: [], count: 0 };
+      const ancestors = new Set();
+      while (root.parent_id && byId.has(root.parent_id) && !ancestors.has(conversationId(root))) {
+        ancestors.add(conversationId(root));
+        root = byId.get(root.parent_id);
+      }
+      const family = [];
+      const familyIds = new Set();
+      function gather(id) {
+        if (familyIds.has(id) || !byId.has(id)) return;
+        familyIds.add(id);
+        family.push(byId.get(id));
+        for (const conversation of conversations) {
+          if (conversation.parent_id === id) gather(conversationId(conversation));
+        }
+      }
+      gather(conversationId(root));
+      family.sort((a, b) => Number(a.created_at || 0) - Number(b.created_at || 0));
+      const roots = [];
+      const nodeMap = new Map();
+      let count = 0;
+      for (const conversation of family) {
+        const id = conversationId(conversation);
+        const parent = conversation.parent_id && familyIds.has(conversation.parent_id)
+          ? byId.get(conversation.parent_id)
+          : null;
+        const parentId = parent ? conversationId(parent) : '';
+        const turns = Array.isArray(conversation.turns) && conversation.turns.length
+          ? conversation.turns
+          : [{ task: conversation.task || conversation.title || 'Untitled conversation' }];
+        const startTurn = parent ? Math.max(0, Number(conversation.branch_turn_index ?? 0)) : 0;
+        if (parent) {
+          for (let index = 0; index < startTurn; index++) {
+            const shared = nodeMap.get(parentId + ':' + index);
+            if (shared) nodeMap.set(id + ':' + index, shared);
+          }
+        }
+        let previous = null;
+        for (let index = startTurn; index < turns.length; index++) {
+          const node = {
+            id: id + ':' + index,
+            sessionId: id,
+            turnIndex: index,
+            task: String(turns[index].task || '(image input)'),
+            branchTitle: conversation.title || conversation.task || 'Untitled conversation',
+            state: conversationState(conversation),
+            children: [],
+          };
+          nodeMap.set(node.id, node);
+          count++;
+          if (previous) {
+            previous.children.push(node);
+          } else {
+            const anchor = parent && startTurn > 0 ? nodeMap.get(parentId + ':' + (startTurn - 1)) : null;
+            (anchor ? anchor.children : roots).push(node);
+          }
+          previous = node;
+        }
+      }
+      return { roots, count };
+    }
+
+    function drawConversationTreeEdges() {
+      mainConversationTree.querySelector('.main-tree-connectors')?.remove();
+      if (mainTreeView.hidden || !conversationTreeEdges.length) return;
+      const bounds = mainConversationTree.getBoundingClientRect();
+      const width = Math.max(mainConversationTree.clientWidth, mainConversationTree.scrollWidth);
+      const height = mainConversationTree.scrollHeight;
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.classList.add('main-tree-connectors');
+      svg.setAttribute('width', width);
+      svg.setAttribute('height', height);
+      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      svg.setAttribute('aria-hidden', 'true');
+      for (const edge of conversationTreeEdges) {
+        const parentDot = conversationTreeDots.get(edge.parent);
+        const childDot = conversationTreeDots.get(edge.child);
+        if (!parentDot || !childDot) continue;
+        const parent = parentDot.getBoundingClientRect();
+        const child = childDot.getBoundingClientRect();
+        const from = {
+          x: parent.left + parent.width / 2 - bounds.left + mainTreeView.scrollLeft,
+          y: parent.top + parent.height / 2 - bounds.top + mainTreeView.scrollTop,
+        };
+        const to = {
+          x: child.left + child.width / 2 - bounds.left + mainTreeView.scrollLeft,
+          y: child.top + child.height / 2 - bounds.top + mainTreeView.scrollTop,
+        };
+        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        path.setAttribute('class', 'main-tree-edge');
+        path.setAttribute('d', `M ${from.x} ${from.y} L ${to.x} ${to.y}`);
+        svg.appendChild(path);
+      }
+      mainConversationTree.prepend(svg);
+    }
+
+    function scheduleConversationTreeEdges() {
+      if (conversationTreeEdgesFrame !== null) cancelAnimationFrame(conversationTreeEdgesFrame);
+      conversationTreeEdgesFrame = requestAnimationFrame(() => {
+        conversationTreeEdgesFrame = null;
+        drawConversationTreeEdges();
+      });
+    }
+
+    window.addEventListener('resize', scheduleConversationTreeEdges);
+
+    function renderConversationTree() {
+      const { roots, count } = currentConversationTree();
+      conversationTreeEdges = [];
+      conversationTreeDots = new Map();
+      mainConversationTree.replaceChildren();
+      treeCount.textContent = count + (count === 1 ? ' input' : ' inputs');
+      if (!roots.length) {
+        mainConversationTree.textContent = 'Select a conversation to view its branches.';
+        return;
+      }
+      function mainNode(node) {
+        const family = document.createElement('div');
+        family.className = 'main-tree-family';
+        const row = document.createElement('div');
+        row.className = 'main-tree-node-row';
+        const dot = document.createElement('span');
+        dot.className = 'main-tree-dot' + (node.sessionId === selectedSessionId ? ' active' : '');
+        dot.setAttribute('aria-hidden', 'true');
+        conversationTreeDots.set(node.id, dot);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'main-tree-node' + (node.sessionId === selectedSessionId ? ' active' : '');
+        const task = document.createElement('span');
+        task.className = 'main-tree-node-task';
+        task.textContent = node.task;
+        const meta = document.createElement('span');
+        meta.className = 'main-tree-node-meta';
+        meta.textContent = node.branchTitle + ' · input ' + (node.turnIndex + 1);
+        button.append(task, meta);
+        button.addEventListener('click', () => navigateToTreeNode(node));
+        row.append(dot, button);
+        family.appendChild(row);
+        if (node.children.length) {
+          const children = document.createElement('div');
+          children.className = 'main-tree-children ' + (node.children.length === 1 ? 'single' : 'branched');
+          for (const child of node.children) {
+            conversationTreeEdges.push({ parent: node.id, child: child.id });
+            children.appendChild(mainNode(child));
+          }
+          family.appendChild(children);
+        }
+        return family;
+      }
+      for (const node of roots) mainConversationTree.appendChild(mainNode(node));
+      scheduleConversationTreeEdges();
+    }
+
+    function setConversationTreeExpanded(expanded) {
+      treeToggle.setAttribute('aria-expanded', String(expanded));
+      mainTreeView.hidden = !expanded;
+      if (expanded) {
+        mainTreeView.scrollTop = 0;
+        renderConversationTree();
+      }
+    }
+
+    function highlightUserCard(card) {
+      if (!card) return;
+      card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      card.classList.add('tree-highlight');
+      setTimeout(() => card.classList.remove('tree-highlight'), 1400);
+    }
+
+    function scrollToUserTurn(node) {
+      const card = Array.from(feed.querySelectorAll('.card.user')).find(
+        (item) => Number(item.dataset.turnIndex) === node.turnIndex,
+      );
+      highlightUserCard(card);
+    }
+
+    async function navigateToTreeNode(node) {
+      setConversationTreeExpanded(false);
+      if (node.sessionId !== selectedSessionId) {
+        pendingTreeNavigation = node;
+        await selectConversation(node.sessionId);
+      } else {
+        scrollToUserTurn(node);
+      }
+    }
+
+    treeToggle.addEventListener('click', () => {
+      setConversationTreeExpanded(treeToggle.getAttribute('aria-expanded') !== 'true');
+    });
+    mainTreeClose.addEventListener('click', () => setConversationTreeExpanded(false));
+
     function renderConversationList() {
       conversationList.querySelectorAll(".conversation-item").forEach((item) => item.remove());
       conversationEmpty.hidden = conversations.length > 0;
@@ -4246,21 +4860,22 @@ _HTML = r"""<!doctype html>
         if (!id) continue;
         const button = document.createElement("button");
         button.type = "button";
-        button.className = "conversation-item" + (id === selectedSessionId ? " active" : "");
+        button.className = "conversation-item" + (id === selectedSessionId ? " active" : "") + (conversation.pinned ? " pinned" : "");
         button.dataset.sessionId = id;
         const workspacePath = conversationWorkspacePath(conversation);
         button.title = [
-          conversation.task || "",
+          conversation.title || conversation.task || "",
           "Click to copy full ID: " + id,
           workspacePath,
         ].filter(Boolean).join("\n");
         button.addEventListener("click", () => selectConversation(id));
+        button.addEventListener("contextmenu", (event) => showConversationContextMenu(event, id));
 
         const titleRow = document.createElement("span");
         titleRow.className = "conversation-title-row";
         const title = document.createElement("span");
         title.className = "conversation-title";
-        title.textContent = conversation.task || "Untitled conversation";
+        title.textContent = conversation.title || conversation.task || "Untitled conversation";
         titleRow.appendChild(title);
         if (workspacePath) {
           const workspace = document.createElement("span");
@@ -4298,6 +4913,7 @@ _HTML = r"""<!doctype html>
         button.appendChild(meta);
         conversationList.appendChild(button);
       }
+      renderConversationTree();
     }
 
     function resetRunView(conversation) {
@@ -4305,12 +4921,11 @@ _HTML = r"""<!doctype html>
       resetActivity();
       currentAssistant = null;
       currentReasoning = null;
-      conversationLabel.textContent = (conversation && conversation.task) || (conversation && conversationId(conversation) ? "Untitled conversation" : "New conversation");
+      conversationLabel.textContent = (conversation && (conversation.title || conversation.task)) || (conversation && conversationId(conversation) ? "Untitled conversation" : "New conversation");
       setConversationWorkspace(conversation);
       statStep.textContent = conversation && conversation.n_calls ? String(conversation.n_calls) : "-";
       statCost.textContent = "$" + Number((conversation && conversation.cost) || 0).toFixed(4);
       setTokenStatsFromConversation(conversation);
-      statExit.textContent = (conversation && conversation.exit_status) || "-";
       renderModelSwitcher(
         conversation && conversation.model_name
           ? conversation.model_name
@@ -4347,6 +4962,7 @@ _HTML = r"""<!doctype html>
 
     async function selectConversation(sessionId) {
       if (!sessionId) return;
+      setConversationTreeExpanded(false);
       if (sessionId === selectedSessionId && eventSource) return;
       closeEventStream();
       selectedSessionId = sessionId;
@@ -4372,6 +4988,9 @@ _HTML = r"""<!doctype html>
       }
       switch (event.type) {
         case "run_start":
+          if (!replayingHistory) {
+            runTokenUsage = { prompt: 0, completion: 0, total: 0 };
+          }
           addRunMarker("start", "Run started", event.step_limit ? "limit " + event.step_limit + " steps" : "");
           addUserCard(event.task || "", event.images || []);
           setStatus("running", "running");
@@ -4430,8 +5049,10 @@ _HTML = r"""<!doctype html>
               status: "thinking",
             });
           }
+          beginActivityPhase(currentActivityStep, "thinking", activityEventTime(event));
           break;
         case "assistant_delta": {
+          beginActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, "reply", activityEventTime(event));
           const card = ensureAssistantCard();
           activityLiveText += event.text || "";
           appendText(card, event.text || "");
@@ -4445,6 +5066,7 @@ _HTML = r"""<!doctype html>
           break;
         }
         case "reasoning_delta": {
+          beginActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, "thinking", activityEventTime(event));
           const card = ensureAssistantCard();
           if (!currentReasoning) {
             const details = document.createElement("details");
@@ -4472,7 +5094,11 @@ _HTML = r"""<!doctype html>
         case "tool_call_delta":
           if (!currentAssistant) ensureAssistantCard();
           break;
+        case "assistant_end":
+          endActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, activityEventTime(event));
+          break;
         case "assistant_message": {
+          endActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, activityEventTime(event));
           const card = ensureAssistantCard();
           if (event.content) {
             let content = card.querySelector(".content");
@@ -4537,6 +5163,7 @@ _HTML = r"""<!doctype html>
         case "observation":
           break;
         case "format_error": {
+          endActivityPhase(currentActivityStep, activityEventTime(event));
           currentAssistant = null;
           currentReasoning = null;
           activityLiveText = "";
@@ -4584,10 +5211,11 @@ _HTML = r"""<!doctype html>
           break;
         }
         case "done": {
-          statExit.textContent = event.exit_status || "-";
-          statCost.textContent = "$" + Number(event.cost || 0).toFixed(4);
-          statStep.textContent = String(event.n_calls ?? statStep.textContent);
-          updateTokenStatsFromDone(event);
+          if (!replayingHistory) {
+            statCost.textContent = "$" + Number(event.conversation_cost ?? event.cost ?? 0).toFixed(4);
+            statStep.textContent = String(event.n_calls ?? statStep.textContent);
+            updateTokenStatsFromDone(event);
+          }
           const exitStatus = event.exit_status || "done";
           const doneState = conversationStateFromStatus(exitStatus, true);
           const headerState = doneState === "failed" ? "error" : doneState;
@@ -4689,8 +5317,10 @@ _HTML = r"""<!doctype html>
         statStep.textContent = "-";
         statCost.textContent = "$0.0000";
         currentTokenUsage = { prompt: 0, completion: 0, total: 0 };
+        completedTokenUsage = { prompt: 0, completion: 0, total: 0 };
+        runTokenUsage = { prompt: 0, completion: 0, total: 0 };
         setTokenStats(0, 0, 0);
-        statExit.textContent = "-";
+        setContextStats(0);
       }
       setStatus("starting", "running");
       stopButton.disabled = true;
@@ -4776,6 +5406,7 @@ _HTML = r"""<!doctype html>
 
     function startNewConversation() {
       closeEventStream();
+      setConversationTreeExpanded(false);
       selectedSessionId = null;
       rememberSession("");
       renderConversationList();
@@ -4786,8 +5417,10 @@ _HTML = r"""<!doctype html>
       statStep.textContent = "-";
       statCost.textContent = "$0.0000";
       currentTokenUsage = { prompt: 0, completion: 0, total: 0 };
+      completedTokenUsage = { prompt: 0, completion: 0, total: 0 };
+      runTokenUsage = { prompt: 0, completion: 0, total: 0 };
       setTokenStats(0, 0, 0);
-      statExit.textContent = "-";
+      setContextStats(0);
       renderModelSwitcher(String(guiSettings.active_model || ""));
       setStatus("idle", "");
       setComposerRunning(false);
@@ -4859,12 +5492,10 @@ _HTML = r"""<!doctype html>
         taskEl.value = config.initial_task;
         resizeTaskInput();
       }
-      document.getElementById("model-label").textContent = config.model_name || "default model";
-      const databasePathEl = document.getElementById("database-path");
-      if (config.database_path) {
-        databasePathEl.textContent = "SQLite: " + config.database_path;
-        databasePathEl.title = "SQLite conversation database: " + config.database_path;
-      }
+      databasePath = config.database_path || "";
+      const databaseElement = document.getElementById("settings-database");
+      databaseElement.textContent = databasePath ? "SQLite: " + databasePath : "-";
+      databaseElement.title = databasePath;
     }).catch(() => {});
 
     async function restoreConversation() {
@@ -5000,6 +5631,10 @@ class GuiSession:
     ):
         self.session_id = uuid.uuid4().hex
         self.task = task
+        self.title = task
+        self.pinned = False
+        self.parent_id = ''
+        self.branch_turn_index = -1
         self.images = list(images or [])
         # ``task`` is the conversation title (its first user message), while
         # ``current_*`` describes the turn that is currently executing.  Keeping
@@ -5011,6 +5646,7 @@ class GuiSession:
         self.workspace = config.workspace
         self.agent_factory = agent_factory or (lambda: create_agent_from_config(config))
         self.events: list[dict[str, Any]] = []
+        self._next_event_index = 0
         self.condition = threading.Condition()
         self.stop_requested = threading.Event()
         self.agent: Any | None = None
@@ -5019,9 +5655,15 @@ class GuiSession:
         self.created_at = time.time()
         self.exit_status = ""
         self.cost = 0.0
+        self.completed_cost = 0.0
         self.n_calls = 0
         self.tokens = 0
         self.token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # Token usage of finished turns plus the current turn, so the Run panel
+        # can show whole-conversation consumption instead of only the last run.
+        self.completed_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.run_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        self.context_tokens = 0
         self.error = ""
         self.trajectory: dict[str, Any] | None = None
         # Cumulative message history for this conversation.  It is seeded into
@@ -5039,11 +5681,20 @@ class GuiSession:
         *,
         config: GuiConfig,
         store: ConversationStore | None = None,
+        event_indices: list[int] | None = None,
     ) -> GuiSession:
         """Recreate a completed or interrupted session loaded from SQLite."""
         session = cls.__new__(cls)
         session.session_id = str(summary["session_id"])
         session.task = str(summary.get("task") or "")
+        session.title = str(summary.get("title") or session.task)
+        session.pinned = bool(summary.get("pinned"))
+        session.parent_id = str(summary.get("parent_id") or "")
+        session.branch_turn_index = int(summary.get("branch_turn_index", -1))
+        # Persisted event indices can have gaps (older branch copies did not
+        # store their prefix). Continue after the highest stored index so new
+        # events never overwrite surviving history.
+        session._next_event_index = (max(event_indices) + 1) if event_indices else len(events)
         session.images = list(
             next((event.get("images") for event in events if event.get("type") == "run_start"), []) or []
         )
@@ -5073,7 +5724,34 @@ class GuiSession:
             "completion_tokens": int(usage.get("completion_tokens") or summary.get("completion_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or summary.get("total_tokens") or 0),
         }
-        session.tokens = session.token_usage["total_tokens"]
+        # Summaries written by older versions only stored the last run. Rebuild
+        # whole-conversation totals from the persisted terminal events.
+        completed = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        completed_cost = 0.0
+        context_tokens = 0
+        saw_done = False
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "done":
+                saw_done = True
+                event_usage = event.get("token_usage") or event.get("cumulative_usage") or {}
+                if isinstance(event_usage, dict):
+                    for key in completed:
+                        completed[key] += int(event_usage.get(key) or 0)
+                completed_cost += float(event.get("cost") or 0.0)
+            elif event_type in ("assistant_message", "format_error"):
+                event_usage = event.get("usage") or {}
+                usage_total = event_usage.get("total_tokens") if isinstance(event_usage, dict) else 0
+                context_tokens = int(event.get("total_tokens") or usage_total or 0) or context_tokens
+        if not saw_done:
+            completed = {key: int(session.token_usage.get(key) or 0) for key in completed}
+        session.completed_token_usage = completed
+        session.run_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        session.token_usage = dict(completed)
+        session.tokens = completed["total_tokens"]
+        session.completed_cost = completed_cost
+        session.cost = completed_cost
+        session.context_tokens = context_tokens
         session.error = str(summary.get("error") or "")
         session.trajectory = (
             store.load_trajectory(session.session_id)
@@ -5234,15 +5912,33 @@ class GuiSession:
         insert_at = 1 if messages and messages[0].get("role") == "system" else 0
         messages.insert(insert_at, {"role": "user", "content": context})
 
-    def _set_token_usage(self, prompt: Any = 0, completion: Any = 0, total: Any = 0) -> None:
+    @staticmethod
+    def _usage_dict(prompt: Any = 0, completion: Any = 0, total: Any = 0) -> dict[str, int]:
         prompt_tokens = int(prompt or 0)
         completion_tokens = int(completion or 0)
-        self.token_usage = {
+        return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": int(total or prompt_tokens + completion_tokens),
         }
+
+    def _refresh_token_usage(self) -> None:
+        self.token_usage = {
+            key: self.completed_token_usage[key] + self.run_token_usage[key]
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        }
         self.tokens = self.token_usage["total_tokens"]
+
+    def _set_token_usage(self, prompt: Any = 0, completion: Any = 0, total: Any = 0) -> None:
+        """Set the current turn's usage; the summary always exposes conversation totals."""
+        self.run_token_usage = self._usage_dict(prompt, completion, total)
+        self._refresh_token_usage()
+
+    def _add_token_usage(self, usage: dict, *, completed: bool) -> None:
+        target = self.completed_token_usage if completed else self.run_token_usage
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            target[key] += int(usage.get(key) or 0)
+        self._refresh_token_usage()
 
     def _summary_locked(self) -> dict[str, Any]:
         status = self.exit_status or ("running" if not self.done else "done")
@@ -5251,6 +5947,14 @@ class GuiSession:
             "id": self.session_id,
             "session_id": self.session_id,
             "task": self.task,
+            "title": self.title,
+            "pinned": self.pinned,
+            "parent_id": self.parent_id,
+            "branch_turn_index": self.branch_turn_index,
+            "turns": [
+                {"task": str(event.get("task") or ""), "image_count": len(event.get("images") or [])}
+                for event in self.events if event.get("type") == "run_start"
+            ],
             "image_count": len(self.images),
             "workspace": self.workspace,
             "model_name": self.model_name,
@@ -5265,6 +5969,10 @@ class GuiSession:
             "completion_tokens": self.token_usage["completion_tokens"],
             "total_tokens": self.tokens,
             "tokens": self.tokens,
+            "total_prompt_tokens": self.token_usage["prompt_tokens"],
+            "total_completion_tokens": self.token_usage["completion_tokens"],
+            "total_tokens_used": self.tokens,
+            "context_tokens": self.context_tokens,
             "token_usage": dict(self.token_usage),
             "event_count": len(self.events),
             "error": self.error,
@@ -5309,6 +6017,7 @@ class GuiSession:
 
     def emit(self, event: dict[str, Any]) -> None:
         safe_event = _json_safe(event)
+        safe_event.setdefault("timestamp", time.time())
         with self.condition:
             self.events.append(safe_event)
             event_type = safe_event.get("type")
@@ -5322,40 +6031,53 @@ class GuiSession:
                     )
                 else:
                     usage = safe_event.get("usage") or {}
-                    self._set_token_usage(
-                        self.token_usage["prompt_tokens"]
-                        + int(usage.get("prompt_tokens") or safe_event.get("prompt_tokens") or 0),
-                        self.token_usage["completion_tokens"]
-                        + int(usage.get("completion_tokens") or safe_event.get("completion_tokens") or 0),
-                        self.token_usage["total_tokens"]
-                        + int(
-                            usage.get("total_tokens") or safe_event.get("tokens") or safe_event.get("total_tokens") or 0
+                    self._add_token_usage(
+                        self._usage_dict(
+                            usage.get("prompt_tokens") or safe_event.get("prompt_tokens") or 0,
+                            usage.get("completion_tokens") or safe_event.get("completion_tokens") or 0,
+                            usage.get("total_tokens")
+                            or safe_event.get("tokens")
+                            or safe_event.get("total_tokens")
+                            or 0,
                         ),
+                        completed=False,
                     )
+                self.context_tokens = int(
+                    safe_event.get("total_tokens") or (safe_event.get("usage") or {}).get("total_tokens") or 0
+                )
             if event_type == "done":
                 self._done_emitted = True
                 self.exit_status = str(safe_event.get("exit_status") or "done")
-                self.cost = float(safe_event.get("cost") or 0.0)
                 self.n_calls = int(safe_event.get("n_calls") or 0)
                 usage = safe_event.get("token_usage") or safe_event.get("cumulative_usage") or safe_event.get("usage")
                 if not isinstance(usage, dict):
                     usage = {}
-                self._set_token_usage(
-                    safe_event.get(
-                        "total_prompt_tokens", usage.get("prompt_tokens", safe_event.get("prompt_tokens", 0))
+                self._add_token_usage(
+                    self._usage_dict(
+                        safe_event.get(
+                            "total_prompt_tokens", usage.get("prompt_tokens", safe_event.get("prompt_tokens", 0))
+                        ),
+                        safe_event.get(
+                            "total_completion_tokens",
+                            usage.get("completion_tokens", safe_event.get("completion_tokens", 0)),
+                        ),
+                        safe_event.get(
+                            "total_tokens_used",
+                            usage.get("total_tokens", safe_event.get("total_tokens", safe_event.get("tokens", 0))),
+                        ),
                     ),
-                    safe_event.get(
-                        "total_completion_tokens",
-                        usage.get("completion_tokens", safe_event.get("completion_tokens", 0)),
-                    ),
-                    safe_event.get(
-                        "total_tokens_used",
-                        usage.get("total_tokens", safe_event.get("total_tokens", safe_event.get("tokens", 0))),
-                    ),
+                    completed=True,
                 )
+                self.run_token_usage = self._usage_dict()
+                self._refresh_token_usage()
+                self.completed_cost += float(safe_event.get("cost") or 0.0)
+                self.cost = self.completed_cost
             elif event_type == "error":
                 self.error = str(safe_event.get("message") or "Unknown error")
-            event_index = len(self.events) - 1
+            safe_event["conversation_usage"] = dict(self.token_usage)
+            safe_event["conversation_cost"] = self.cost
+            event_index = self._next_event_index
+            self._next_event_index += 1
             summary = self._summary_locked()
             self.condition.notify_all()
         self._persist_event(summary, event_index, safe_event, event_type)
@@ -5760,7 +6482,8 @@ class GuiSessionManager:
 
     def _restore_sessions(self) -> None:
         for summary in self.store.load_sessions():
-            events = self.store.load_events(summary["session_id"])
+            entries = self.store.load_event_entries(summary["session_id"])
+            events = [event for _, event in entries]
             last_event_type = events[-1].get("type") if events else ""
             if last_event_type == "done":
                 if not summary.get("done"):
@@ -5774,7 +6497,13 @@ class GuiSessionManager:
                 summary["status"] = "Interrupted"
                 summary["exit_status"] = "Interrupted"
                 self.store.save_session(summary)
-            session = GuiSession.restore(summary, events, config=self.config, store=self.store)
+            session = GuiSession.restore(
+                summary,
+                events,
+                config=self.config,
+                store=self.store,
+                event_indices=[index for index, _ in entries],
+            )
             if self.agent_factory is not None:
                 # A custom factory (used by tests and integrations) should also
                 # be available when continuing a conversation restored from
@@ -5829,6 +6558,121 @@ class GuiSessionManager:
             session.set_model(selected_model, self._agent_factory_for_model(selected_model))
         return session, session.continue_run(task, images=images)
 
+    def rename_session(self, session_id: str, title: str) -> GuiSession | None:
+        session = self.get_session(session_id)
+        title = title.strip()
+        if not title:
+            raise ValueError('Title must not be empty')
+        if session is not None:
+            with session.condition:
+                session.title = title
+            session._persist_summary()
+        return session
+
+    def set_session_pinned(self, session_id: str, pinned: bool) -> GuiSession | None:
+        session = self.get_session(session_id)
+        if session is not None:
+            with session.condition:
+                session.pinned = bool(pinned)
+            session._persist_summary()
+        return session
+
+    def delete_session(self, session_id: str) -> GuiSession | None:
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+        if not session.done:
+            session.request_stop()
+            if not session.wait(timeout=5.0):
+                raise RuntimeError('Conversation is still stopping')
+        with self._lock:
+            self.sessions.pop(session_id, None)
+        self.store.delete_session(session_id)
+        return session
+
+
+    @staticmethod
+    def _message_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return '\n'.join(
+                str(part.get('text') or '') for part in content if isinstance(part, dict)
+            )
+        return str(content or '')
+
+    def branch_session(self, session_id: str, turn_index: int, task: str) -> GuiSession | None:
+        source = self.get_session(session_id)
+        task = task.strip()
+        if not task:
+            raise ValueError('Task must not be empty')
+        if source is None:
+            return None
+        with source.condition:
+            if not source.done:
+                raise RuntimeError('Wait for the conversation to finish before branching')
+            events = copy.deepcopy(source.events)
+            source_messages = copy.deepcopy(source.messages)
+            source_config = copy.deepcopy(source.config)
+            factory = source.agent_factory
+        run_starts = [index for index, event in enumerate(events) if event.get('type') == 'run_start']
+        if not isinstance(turn_index, int) or isinstance(turn_index, bool):
+            raise ValueError('turn_index must be an integer')
+        if turn_index < 0 or turn_index >= len(run_starts):
+            raise ValueError('Invalid conversation turn')
+        event_offset = run_starts[turn_index]
+        prefix = events[:event_offset]
+        target = events[event_offset]
+        tasks = [str(events[index].get('task') or '') for index in run_starts]
+        history: list[dict[str, Any]] = []
+        if turn_index:
+            search_from = 0
+            for index, original_task in enumerate(tasks[: turn_index + 1]):
+                position = next(
+                    (
+                        position
+                        for position in range(search_from, len(source_messages))
+                        if source_messages[position].get('role') == 'user'
+                        and original_task.strip() in self._message_text(source_messages[position].get('content')).strip()
+                    ),
+                    None,
+                )
+                if position is None:
+                    break
+                if index == turn_index:
+                    history = source_messages[:position]
+                    break
+                search_from = position + 1
+            if not history:
+                for event in prefix:
+                    if event.get('type') == 'run_start' and str(event.get('task') or '').strip():
+                        history.append({'role': 'user', 'content': str(event['task'])})
+                    elif event.get('type') == 'assistant_message' and str(event.get('content') or '').strip():
+                        history.append({'role': 'assistant', 'content': str(event['content'])})
+        selected_model = source.model_name
+        branch = GuiSession(
+            task,
+            config=source_config,
+            model_name=selected_model,
+            images=list(target.get('images') or []),
+            agent_factory=factory or self._agent_factory_for_model(selected_model),
+            store=None,
+        )
+        branch.parent_id = source.session_id
+        branch.branch_turn_index = turn_index
+        for event in prefix:
+            branch.emit(event)
+        branch.done = True
+        branch._done_emitted = True
+        branch.messages = history
+        branch._store = self.store
+        self.store.save_events(branch.session_id, list(enumerate(branch.events)))
+        with self._lock:
+            self.sessions[branch.session_id] = branch
+        self.store.save_session(branch.summary())
+        branch.continue_run(task, images=list(target.get('images') or []))
+        return branch
+
     def get_session(self, session_id: str) -> GuiSession | None:
         with self._lock:
             return self.sessions.get(session_id)
@@ -5836,7 +6680,7 @@ class GuiSessionManager:
     def list_sessions(self) -> list[GuiSession]:
         """Return every conversation, newest first."""
         with self._lock:
-            return sorted(self.sessions.values(), key=lambda session: session.created_at, reverse=True)
+            return sorted(self.sessions.values(), key=lambda session: (not session.pinned, -session.created_at))
 
     def list_conversations(self) -> list[GuiSession]:
         """Alias for :meth:`list_sessions`."""
@@ -6111,7 +6955,13 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
             self._send_html(_HTML)
-        elif parsed.path == "/api/health":
+        elif parsed.path in ("/health", "/api/health"):
+            logger.info(
+                "Health probe from %s:%s (User-Agent: %s)",
+                self.client_address[0],
+                self.client_address[1],
+                self.headers.get("User-Agent", ""),
+            )
             self._send_json(HTTPStatus.OK, {"status": "ok"})
         elif parsed.path == "/api/config":
             settings_payload = self.server.manager.model_settings_snapshot()
@@ -6298,6 +7148,41 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                 return
             self._stop_session(session_id)
             return
+        branch_match = re.fullmatch(r'/api/(?:conversations|conversation|sessions|session)/([^/]+)/branch', parsed.path)
+        if branch_match:
+            source_id = unquote(branch_match.group(1))
+            try:
+                payload = self._read_json_body()
+                task = payload.get('task', '')
+                turn_index = payload.get('turn_index')
+                if not isinstance(task, str):
+                    raise ValueError('task must be a string')
+                branch = self.server.manager.branch_session(source_id, turn_index, task)
+                if branch is None:
+                    self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Unknown session'})
+                    return
+            except RuntimeError as exc:
+                self._send_json(HTTPStatus.CONFLICT, {'error': str(exc)})
+                return
+            except (json.JSONDecodeError, ValueError) as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001 - surface setup errors to UI
+                logger.exception('Could not branch GUI session')
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {'error': str(exc)})
+                return
+            self._send_json(
+                HTTPStatus.ACCEPTED,
+                {
+                    'session_id': branch.session_id,
+                    'events_url': f'/api/events/{branch.session_id}',
+                    'conversation': branch.summary(),
+                    'event_offset': 0,
+                    'branched_from': source_id,
+                    'turn_index': turn_index,
+                },
+            )
+            return
         if parsed.path != "/api/run":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
@@ -6361,13 +7246,52 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
-        if not self._dispatch_model_settings_write("PATCH", parsed.path):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        if self._dispatch_model_settings_write("PATCH", parsed.path):
+            return
+        match = re.fullmatch(r'/api/(?:conversations|conversation|sessions|session)/([^/]+)', parsed.path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Not found'})
+            return
+        session_id = unquote(match.group(1))
+        try:
+            payload = self._read_json_body()
+            if 'title' not in payload and 'pinned' not in payload:
+                raise ValueError('Provide title or pinned')
+            if 'title' in payload:
+                if not isinstance(payload['title'], str):
+                    raise ValueError('title must be a string')
+                session = self.server.manager.rename_session(session_id, payload['title'])
+            else:
+                session = self.server.manager.get_session(session_id)
+            if session is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Unknown session'})
+                return
+            if 'pinned' in payload:
+                if not isinstance(payload['pinned'], bool):
+                    raise ValueError('pinned must be a boolean')
+                session = self.server.manager.set_session_pinned(session_id, payload['pinned'])
+            self._send_json(HTTPStatus.OK, {'conversation': session.summary(), 'session': session.summary()})
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {'error': str(exc)})
 
     def do_DELETE(self) -> None:  # noqa: N802 - stdlib method name
         parsed = urlparse(self.path)
-        if not self._dispatch_model_settings_write("DELETE", parsed.path):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+        if self._dispatch_model_settings_write("DELETE", parsed.path):
+            return
+        match = re.fullmatch(r'/api/(?:conversations|conversation|sessions|session)/([^/]+)', parsed.path)
+        if not match:
+            self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Not found'})
+            return
+        session_id = unquote(match.group(1))
+        try:
+            session = self.server.manager.delete_session(session_id)
+        except RuntimeError as exc:
+            self._send_json(HTTPStatus.CONFLICT, {'error': str(exc)})
+            return
+        if session is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {'error': 'Unknown session'})
+            return
+        self._send_json(HTTPStatus.OK, {'deleted': session_id})
 
     def _stream_events(self, session: GuiSession, *, since: int = 0) -> None:
         try:

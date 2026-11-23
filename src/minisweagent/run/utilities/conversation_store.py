@@ -33,6 +33,11 @@ class ConversationStore:
                 CREATE TABLE IF NOT EXISTS conversations (
                     session_id TEXT PRIMARY KEY,
                     task TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    parent_id TEXT NOT NULL DEFAULT '',
+                    branch_turn_index INTEGER NOT NULL DEFAULT -1,
+                    deleted_at REAL NOT NULL DEFAULT 0,
                     workspace TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'running',
                     created_at REAL NOT NULL,
@@ -60,6 +65,16 @@ class ConversationStore:
                     ON events(session_id, event_index);
                 """
             )
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(conversations)")}
+            for name, definition in (
+                ("title", "TEXT NOT NULL DEFAULT ''"),
+                ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+                ("parent_id", "TEXT NOT NULL DEFAULT ''"),
+                ("branch_turn_index", "INTEGER NOT NULL DEFAULT -1"),
+                ("deleted_at", "REAL NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE conversations ADD COLUMN {name} {definition}")
             self._conn.commit()
 
     def close(self) -> None:
@@ -90,6 +105,10 @@ class ConversationStore:
             str(summary.get("error") or ""),
             int(summary.get("event_count") or 0),
             json.dumps(summary["trajectory"], default=str) if summary.get("trajectory") is not None else None,
+            str(summary.get('title') or ''),
+            int(bool(summary.get('pinned'))),
+            str(summary.get('parent_id') or ''),
+            int(summary.get('branch_turn_index', -1)),
         )
 
     def _save_summary_locked(self, summary: dict[str, Any], *, commit: bool = True) -> None:
@@ -100,8 +119,8 @@ class ConversationStore:
                 session_id, task, workspace, status, created_at, updated_at,
                 done, exit_status, cost, n_calls, prompt_tokens,
                 completion_tokens, total_tokens, token_usage, error,
-                event_count, trajectory
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                event_count, trajectory, title, pinned, parent_id, branch_turn_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 task=excluded.task,
                 workspace=excluded.workspace,
@@ -117,7 +136,11 @@ class ConversationStore:
                 token_usage=excluded.token_usage,
                 error=excluded.error,
                 event_count=excluded.event_count,
-                trajectory=COALESCE(excluded.trajectory, conversations.trajectory)
+                trajectory=COALESCE(excluded.trajectory, conversations.trajectory),
+                title=excluded.title,
+                pinned=excluded.pinned,
+                parent_id=excluded.parent_id,
+                branch_turn_index=excluded.branch_turn_index
             """,
             row,
         )
@@ -166,7 +189,12 @@ class ConversationStore:
         return {
             "id": row["session_id"],
             "session_id": row["session_id"],
-            "task": row["task"],
+            'task': row['task'],
+            'title': row['title'] or row['task'],
+            'pinned': bool(row['pinned']),
+            'parent_id': row['parent_id'],
+            'branch_turn_index': row['branch_turn_index'],
+            'deleted_at': row['deleted_at'],
             "workspace": row["workspace"],
             "status": row["status"],
             "created_at": row["created_at"],
@@ -184,20 +212,50 @@ class ConversationStore:
             "error": row["error"],
         }
 
-    def load_sessions(self) -> list[dict[str, Any]]:
-        """Return persisted conversations, newest first."""
+    def load_sessions(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM conversations ORDER BY created_at DESC").fetchall()
+            query = 'SELECT * FROM conversations'
+            if not include_deleted:
+                query += ' WHERE deleted_at = 0'
+            rows = self._conn.execute(query + ' ORDER BY pinned DESC, created_at DESC').fetchall()
             return [self._row_to_summary(row) for row in rows]
+
+    def delete_session(self, session_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                'UPDATE conversations SET deleted_at=?, updated_at=? WHERE session_id=?',
+                (time.time(), time.time(), session_id),
+            )
+            self._conn.commit()
+
+    def load_event_entries(self, session_id: str) -> list[tuple[int, dict[str, Any]]]:
+        """Return (event_index, event) pairs so restores can resume numbering."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT event_index, data FROM events WHERE session_id=? ORDER BY event_index",
+                (session_id,),
+            ).fetchall()
+        return [(int(row["event_index"]), json.loads(row["data"])) for row in rows]
 
     def load_events(self, session_id: str) -> list[dict[str, Any]]:
         """Return the complete event stream for a conversation."""
+        return [event for _, event in self.load_event_entries(session_id)]
+
+    def save_events(self, session_id: str, entries: list[tuple[int, dict[str, Any]]]) -> None:
+        """Bulk-insert events, used when a branch copies its prefix history."""
+        if not entries:
+            return
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT data FROM events WHERE session_id=? ORDER BY event_index",
-                (session_id,),
-            ).fetchall()
-        return [json.loads(row["data"]) for row in rows]
+            now = time.time()
+            self._conn.executemany(
+                """
+                INSERT INTO events (session_id, event_index, created_at, data)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id, event_index) DO UPDATE SET data=excluded.data
+                """,
+                [(session_id, int(index), now, json.dumps(event, default=str)) for index, event in entries],
+            )
+            self._conn.commit()
 
     def load_trajectory(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest persisted agent trajectory for a conversation."""

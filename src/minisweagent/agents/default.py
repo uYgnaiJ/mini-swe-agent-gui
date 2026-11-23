@@ -5,6 +5,7 @@ or https://minimal-agent.com for a tutorial on the basic building principles.
 import copy
 import json
 import logging
+import re
 import threading
 import time
 import traceback
@@ -70,14 +71,18 @@ Continue only when concrete progress is still possible, and keep next_steps tigh
 def _extract_json_object(text: str) -> dict | None:
     """Return the first JSON object embedded in model output, if any."""
     value = str(text or "")
-    start, end = value.find("{"), value.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        parsed = json.loads(value[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", value, flags=re.DOTALL | re.IGNORECASE)
+    for candidate in [*fenced, value]:
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start < 0 or end <= start:
+            continue
+        try:
+            parsed = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 class AgentConfig(BaseModel):
@@ -197,7 +202,35 @@ class DefaultAgent:
         extra = message.get("extra", {})
         self.cost += extra.get("cost", 0.0)
         self._record_token_usage(message)
-        return _extract_json_object(get_content_string(message))
+        content = get_content_string(message)
+        parsed = _extract_json_object(content)
+        if parsed is None:
+            self.logger.warning("Planner/checkpoint response was not valid JSON: %r", content[:500])
+        return parsed
+
+    def _plain_text_summary(self) -> str:
+        """Ask for a short, human-readable summary when the JSON checkpoint fails."""
+        try:
+            message = self.model.query(
+                [
+                    {"role": "system", "content": "You summarize work for the user in 2-3 sentences. Reply in plain text."},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Task: {self.extra_template_vars.get('task', '')}\n"
+                            f"Steps used: {self.n_calls}\n"
+                            f"Work so far:\n{self._conversation_excerpt() or '(no messages)'}\n\n"
+                            "Summarize what was done, what is still missing, and whether the user should continue."
+                        ),
+                    },
+                ]
+            )
+        except Exception:  # noqa: BLE001 - the run must end even if the summary call fails
+            return ""
+        extra = message.get("extra", {})
+        self.cost += extra.get("cost", 0.0)
+        self._record_token_usage(message)
+        return get_content_string(message).strip()
 
     def _budget_from_plan(self, plan: dict | None) -> int:
         """Clamp a planner/checkpoint step estimate to the configured bounds."""
@@ -264,14 +297,25 @@ class DefaultAgent:
         answer = ""
         if decision:
             answer = str(decision.get("answer") or "").strip() or str(decision.get("summary") or "").strip()
-        status = "Submitted" if answer else "LimitsExceeded"
+        if not answer:
+            # The checkpoint could not produce usable JSON (or the model refused
+            # to stop). Ask once more for a plain-text summary so the user still
+            # receives an explanation instead of an empty "LimitsExceeded".
+            answer = self._plain_text_summary()
+        if answer:
+            status = "Submitted"
+            message = answer
+        else:
+            status = "LimitsExceeded"
+            message = f"Stopped after reaching the {self._step_budget}-step budget and no summary could be generated."
         raise Submitted(
             self.model.format_message(
                 role="exit",
-                content=answer or "Stopped after reaching the step budget.",
+                content=message,
                 extra={
                     "exit_status": status,
-                    "submission": answer if status == "Submitted" else "",
+                    "submission": answer,
+                    "message": message,
                     "budget_summary": True,
                 },
             )
@@ -335,6 +379,7 @@ class DefaultAgent:
             "cost": self.cost,
             "n_calls": self.n_calls,
             "calls_without_cost": self.n_calls_without_cost,
+            "message": result.get("message", ""),
             "prompt_tokens": self.token_usage["prompt_tokens"],
             "completion_tokens": self.token_usage["completion_tokens"],
             "total_tokens": self.token_usage["total_tokens"],
