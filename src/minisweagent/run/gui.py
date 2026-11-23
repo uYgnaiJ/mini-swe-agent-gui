@@ -1340,6 +1340,31 @@ _HTML = r"""<!doctype html>
     .card.error { align-self: stretch; border-left: 3px solid var(--err); }
     .card[hidden] { display: none !important; }
     .content { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .content.markdown { white-space: normal; }
+    .content.markdown p { margin: 0 0 0.8em; }
+    .content.markdown > :first-child { margin-top: 0; }
+    .content.markdown > :last-child { margin-bottom: 0; }
+    .content.markdown h1,
+    .content.markdown h2,
+    .content.markdown h3,
+    .content.markdown h4,
+    .content.markdown h5,
+    .content.markdown h6 { margin: 1.1em 0 0.45em; line-height: 1.3; }
+    .content.markdown h1 { font-size: 1.4em; }
+    .content.markdown h2 { font-size: 1.3em; }
+    .content.markdown h3 { font-size: 1.18em; }
+    .content.markdown h4,
+    .content.markdown h5,
+    .content.markdown h6 { font-size: 1.05em; }
+    .content.markdown ul,
+    .content.markdown ol { margin: 0.45em 0 0.85em; padding-left: 1.7em; }
+    .content.markdown li + li { margin-top: 0.25em; }
+    .content.markdown blockquote { margin: 0.7em 0; padding: 0.1em 0 0.1em 0.9em; border-left: 3px solid var(--border); color: var(--muted); }
+    .content.markdown code { padding: 0.12em 0.35em; border-radius: 4px; background: var(--bg); font-family: var(--mono); font-size: 0.9em; }
+    .content.markdown pre { max-width: 100%; margin: 0.65em 0 0.9em; padding: 11px 13px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); white-space: pre; }
+    .content.markdown pre code { padding: 0; background: transparent; overflow-wrap: normal; }
+    .content.markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+    .content.markdown hr { margin: 1em 0; border: 0; border-top: 1px solid var(--border); }
     .card-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
     .card-images a { display: block; line-height: 0; }
     .card-images img {
@@ -3708,14 +3733,174 @@ _HTML = r"""<!doctype html>
       return card;
     }
 
+    function escapeMarkdownHtml(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\x22/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function safeMarkdownUrl(value) {
+      const url = String(value || '').trim();
+      return /^(https?:\/\/|mailto:|#|\/(?!\/)|\.\.?\/)/i.test(url) ? url : '';
+    }
+
+    function renderMarkdownInline(value) {
+      const tokens = [];
+      const token = (html) => {
+        tokens.push(html);
+        return '\u0000' + (tokens.length - 1) + '\u0000';
+      };
+      let text = escapeMarkdownHtml(value);
+      text = text.replace(/`([^`\n]+)`/g, (match, code) => token('<code>' + code + '</code>'));
+      text = text.replace(/\[([^\]\n]+)\]\(([^\s)]+)\)/g, (match, label, url) => {
+        const href = safeMarkdownUrl(url);
+        return href
+          ? token('<a href=\x22' + href + '\x22 target=\x22_blank\x22 rel=\x22noopener noreferrer\x22>' + label + '</a>')
+          : label;
+      });
+      text = text.replace(/\*\*([^*\n]+)\*\*|__([^_\n]+)__/g, (match, stars, underscores) => {
+        return '<strong>' + (stars || underscores) + '</strong>';
+      });
+      text = text.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+      text = text.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+      text = text.replace(/(^|[^\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
+      return text.replace(/\u0000(\d+)\u0000/g, (match, index) => tokens[Number(index)]);
+    }
+
+    function markdownToHtml(markdown) {
+      const lines = String(markdown == null ? '' : markdown).replace(/\r\n?/g, '\n').split('\n');
+      const html = [];
+      let paragraph = [];
+      let quote = [];
+      let listType = '';
+      let codeLanguage = '';
+      let codeLines = null;
+
+      function flushParagraph() {
+        if (!paragraph.length) return;
+        html.push('<p>' + renderMarkdownInline(paragraph.join('\n')).replace(/\n/g, '<br>') + '</p>');
+        paragraph = [];
+      }
+
+      function flushQuote() {
+        if (!quote.length) return;
+        html.push('<blockquote><p>' + renderMarkdownInline(quote.join('\n')).replace(/\n/g, '<br>') + '</p></blockquote>');
+        quote = [];
+      }
+
+      function closeList() {
+        if (!listType) return;
+        html.push('</' + listType + '>');
+        listType = '';
+      }
+
+      function flushCode() {
+        if (codeLines === null) return;
+        const language = codeLanguage ? ' class=\x22language-' + codeLanguage + '\x22' : '';
+        html.push('<pre><code' + language + '>' + escapeMarkdownHtml(codeLines.join('\n')) + '</code></pre>');
+        codeLines = null;
+        codeLanguage = '';
+      }
+
+      for (const line of lines) {
+        const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
+        if (codeLines !== null) {
+          if (fence) flushCode();
+          else codeLines.push(line);
+          continue;
+        }
+        if (fence) {
+          flushParagraph();
+          flushQuote();
+          closeList();
+          codeLanguage = fence[1];
+          codeLines = [];
+          continue;
+        }
+        if (!line.trim()) {
+          flushParagraph();
+          flushQuote();
+          closeList();
+          continue;
+        }
+        const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+        if (heading) {
+          flushParagraph();
+          flushQuote();
+          closeList();
+          const level = heading[1].length;
+          html.push('<h' + level + '>' + renderMarkdownInline(heading[2]) + '</h' + level + '>');
+          continue;
+        }
+        if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+          flushParagraph();
+          flushQuote();
+          closeList();
+          html.push('<hr>');
+          continue;
+        }
+        const quoted = line.match(/^\s{0,3}>\s?(.*)$/);
+        if (quoted) {
+          flushParagraph();
+          closeList();
+          quote.push(quoted[1]);
+          continue;
+        }
+        const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+        const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+        if (unordered || ordered) {
+          flushParagraph();
+          flushQuote();
+          const type = ordered ? 'ol' : 'ul';
+          if (listType !== type) {
+            closeList();
+            html.push('<' + type + '>');
+            listType = type;
+          }
+          html.push('<li>' + renderMarkdownInline((ordered || unordered)[1]) + '</li>');
+          continue;
+        }
+        flushQuote();
+        closeList();
+        paragraph.push(line);
+      }
+      flushCode();
+      flushParagraph();
+      flushQuote();
+      closeList();
+      return html.join('\n');
+    }
+
+    function markdownSource(content) {
+      return content && content.dataset.markdown !== undefined
+        ? content.dataset.markdown
+        : String(content ? content.textContent : '');
+    }
+
+    function setMarkdownContent(content, value) {
+      const source = String(value == null ? '' : value);
+      content.dataset.markdown = source;
+      content.classList.add('markdown');
+      content.innerHTML = markdownToHtml(source);
+    }
+
     function appendText(card, text) {
-      let content = card.querySelector(".content");
+      let content = card.querySelector('.content');
       if (!content) {
-        content = document.createElement("div");
-        content.className = "content";
+        content = document.createElement('div');
+        content.className = 'content';
         card.appendChild(content);
       }
-      content.textContent += text;
+      const source = markdownSource(content) + String(text == null ? '' : text);
+      if (card.classList.contains('user') || card.classList.contains('assistant')) {
+        setMarkdownContent(content, source);
+      } else {
+        content.dataset.markdown = source;
+        content.textContent = source;
+      }
       return content;
     }
 
@@ -3919,10 +4104,10 @@ _HTML = r"""<!doctype html>
       }
       const contentEl = card.querySelector(".content");
       if (!contentEl) return false;
-      const merged = stripCommandFromAssistantContent(contentEl.textContent, command);
+      const merged = stripCommandFromAssistantContent(markdownSource(contentEl), command);
       if (!merged.removed) return false;
 
-      contentEl.textContent = merged.content;
+      setMarkdownContent(contentEl, merged.content);
       pendingAssistantMessage.content = merged.content;
       card.classList.add("command-merged");
       if (!merged.content && !hasVisibleReasoning(card)) {
@@ -3944,7 +4129,7 @@ _HTML = r"""<!doctype html>
       const cards = feed.querySelectorAll(".card.assistant:not([hidden])");
       for (let i = cards.length - 1; i >= 0; i--) {
         const content = cards[i].querySelector(".content");
-        const text = content ? content.textContent.trim() : "";
+        const text = content ? markdownSource(content).trim() : "";
         if (text) return text;
       }
       return "";
@@ -3961,7 +4146,7 @@ _HTML = r"""<!doctype html>
       const contentEl = card && card.querySelector(".content");
       pendingAssistantMessage = {
         card,
-        content: contentEl ? contentEl.textContent : String(content == null ? "" : content),
+        content: contentEl ? markdownSource(contentEl) : String(content == null ? "" : content),
         step,
       };
     }
@@ -4296,7 +4481,7 @@ _HTML = r"""<!doctype html>
               content.className = "content";
               card.insertBefore(content, card.querySelector(".reasoning"));
             }
-            content.textContent = event.content;
+            setMarkdownContent(content, event.content);
           }
           const callTokens = updateTokenStatsFromAssistant(event);
           const callCostKnown = event.cost_known !== false;

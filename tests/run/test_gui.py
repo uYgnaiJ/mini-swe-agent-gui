@@ -1,5 +1,7 @@
 import copy
 import json
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -1045,3 +1047,52 @@ def test_gui_html_exposes_expandable_provider_model_groups():
     assert 'className = "provider-models"' in _HTML
     assert "function toggleProviderModels" in _HTML
     assert '"Add model"' in _HTML
+
+def test_gui_conversation_markdown_is_safe_and_preserves_raw_source():
+    from minisweagent.run.gui import _HTML
+
+    assert "function markdownToHtml" in _HTML
+    assert "function renderMarkdownInline" in _HTML
+    assert "content.dataset.markdown = source;" in _HTML
+    assert "setMarkdownContent(content, event.content);" in _HTML
+    assert "stripCommandFromAssistantContent(markdownSource(contentEl), command)" in _HTML
+    assert "content.textContent = event.content;" not in _HTML
+    assert ".content.markdown pre" in _HTML
+
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is needed to execute the embedded Markdown renderer")
+
+    renderer = "    function escapeMarkdownHtml" + _HTML.split("    function escapeMarkdownHtml", 1)[1].split(
+        "    function markdownSource", 1
+    )[0]
+    script = renderer + r"""
+const assert = require('node:assert/strict');
+const source = [
+  '# Heading',
+  '',
+  '**bold** and *em* with `x < y`.',
+  '',
+  '- one',
+  '- two',
+  '',
+  '```html',
+  '<img src=x onerror=alert(1)>',
+  '```',
+  '',
+  '[safe](https://example.com?a=1&b=2) [bad](javascript:alert(1))',
+  '',
+  '<script>alert(1)</script>'
+].join('\n');
+const rendered = markdownToHtml(source);
+assert.ok(rendered.includes('<h1>Heading</h1>'));
+assert.ok(rendered.includes('<strong>bold</strong> and <em>em</em>'));
+assert.ok(rendered.includes('<code>x &lt; y</code>'));
+assert.ok(rendered.includes('<ul>\n<li>one</li>\n<li>two</li>\n</ul>'));
+assert.ok(rendered.includes('<pre><code class="language-html">&lt;img src=x onerror=alert(1)&gt;</code></pre>'));
+assert.ok(rendered.includes('href="https://example.com?a=1&amp;b=2"'));
+assert.ok(!rendered.includes('href="javascript:'));
+assert.ok(!rendered.includes('<script>'));
+assert.ok(rendered.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+"""
+    completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
