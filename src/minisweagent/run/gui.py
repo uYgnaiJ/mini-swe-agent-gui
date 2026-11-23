@@ -1340,8 +1340,12 @@ _HTML = r"""<!doctype html>
     .content.markdown li + li { margin-top: 0.25em; }
     .content.markdown blockquote { margin: 0.7em 0; padding: 0.1em 0 0.1em 0.9em; border-left: 3px solid var(--border); color: var(--muted); }
     .content.markdown code { padding: 0.12em 0.35em; border-radius: 4px; background: var(--bg); font-family: var(--mono); font-size: 0.9em; }
-    .content.markdown pre { max-width: 100%; margin: 0.65em 0 0.9em; padding: 11px 13px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); white-space: pre; }
+    .content.markdown pre { max-width: 100%; margin: 0.65em 0 0.9em; padding: 11px 13px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--code-bg); color: var(--code-text); white-space: pre; }
     .content.markdown pre code { padding: 0; background: transparent; overflow-wrap: normal; }
+    .content.markdown table { width: 100%; margin: 0.65em 0 0.9em; border-collapse: collapse; }
+    .content.markdown th,
+    .content.markdown td { padding: 0.45em 0.65em; border: 1px solid var(--border); text-align: left; vertical-align: top; }
+    .content.markdown th { background: var(--bg); font-weight: 600; }
     .content.markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
     .content.markdown hr { margin: 1em 0; border: 0; border-top: 1px solid var(--border); }
     .card-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
@@ -1599,6 +1603,9 @@ _HTML = r"""<!doctype html>
     .activity-segment.kind-thinking { background: var(--accent); }
     .activity-segment.kind-reply { background: var(--ok); }
     .activity-segment.kind-tool { background: var(--warn); }
+    .activity-segment.kind-done { background: var(--ok); }
+    .activity-segment.kind-error { background: var(--err); }
+    .activity-segment.kind-running { background: var(--border); margin-left: auto; }
     .activity-overview-empty {
       flex: 1;
       color: var(--muted);
@@ -2410,6 +2417,7 @@ _HTML = r"""<!doctype html>
     let activityFollowOutput = true;
     let currentActivityStep = null;
     let currentActivityStepNumber = null;
+    let currentActivityThinking = null;
     let activityLiveText = "";
     let activityReasoningText = "";
     let activityState = {
@@ -3247,6 +3255,7 @@ _HTML = r"""<!doctype html>
 
     function finalizeOpenActivities(timestamp = Date.now()) {
       activityLog.querySelectorAll(".activity-entry").forEach((entry) => {
+        endActivityPhase(entry, timestamp);
         if (!entry.dataset.endedAt) markActivityEnded(entry, timestamp);
       });
     }
@@ -3393,38 +3402,96 @@ _HTML = r"""<!doctype html>
       const segments = [];
       for (const entry of entries) {
         if (entry.hidden) continue;
-        for (const phase of entry._activityPhases || []) {
-          const duration = Math.max(0, Number(phase.endedAt || now) - Number(phase.startedAt));
-          if (!duration) continue;
-          segments.push({
-            kind: phase.kind,
-            label: entry._activityTitle || 'Activity',
-            duration,
-          });
+        const visibility = Math.max(0, Math.min(1, Number(entry._activityVisibility ?? 1)));
+        if (!visibility) continue;
+        const phases = entry._activityPhases || [];
+        if (!phases.length) continue;
+        let duration = 0;
+        let ongoing = false;
+        let kind = 'step';
+        for (const phase of phases) {
+          const endedAt = Number(phase.endedAt || 0);
+          duration += Math.max(0, (endedAt || now) - Number(phase.startedAt));
+          ongoing = ongoing || !endedAt;
+          kind = phase.kind;
         }
+        segments.push({
+          kind: ongoing ? 'running' : kind,
+          label: entry._activityTitle || 'Activity',
+          duration,
+          visibility,
+          ongoing,
+        });
+      }
+      return segments;
+    }
+
+    function activitySegmentWeights(segments) {
+      const completed = [];
+      const running = [];
+      segments.forEach((segment, index) => {
+        segment.weight = 0;
+        const item = { segment, index };
+        (segment.ongoing ? running : completed).push(item);
+      });
+      const runningShare = running.reduce((total, item) => total + item.segment.visibility * 0.1, 0);
+      if (runningShare >= 1) {
+        const minimumTotal = segments.reduce((total, segment) => total + segment.visibility * 0.1, 0);
+        segments.forEach((segment) => { segment.weight = segment.visibility * 0.1 / minimumTotal; });
+        return segments;
+      }
+      running.forEach((item) => { item.segment.weight = item.segment.visibility * 0.1; });
+      const available = 1 - runningShare;
+      if (!completed.length) return segments;
+      const minimum = (item) => item.segment.visibility * 0.1;
+      const duration = (item) => item.segment.duration * item.segment.visibility;
+      const minimumTotal = completed.reduce((total, item) => total + minimum(item), 0);
+      if (minimumTotal >= available) {
+        completed.forEach((item) => { item.segment.weight = available * minimum(item) / minimumTotal; });
+        return segments;
+      }
+      let pending = completed.slice();
+      let remaining = available;
+      while (pending.length) {
+        const totalDuration = pending.reduce((total, item) => total + duration(item), 0);
+        const floor = pending.find((item) => {
+          const share = totalDuration ? duration(item) / totalDuration * remaining : remaining / pending.length;
+          return share + 1e-12 < minimum(item);
+        });
+        if (!floor) {
+          pending.forEach((item) => {
+            item.segment.weight = totalDuration ? duration(item) / totalDuration * remaining : remaining / pending.length;
+          });
+          break;
+        }
+        floor.segment.weight = minimum(floor);
+        remaining -= minimum(floor);
+        pending = pending.filter((item) => item !== floor);
       }
       return segments;
     }
 
     function activityEntriesInView() {
       const entries = Array.from(activityLog.querySelectorAll('.activity-entry')).filter((entry) => !entry.hidden);
-      if (!activityIsExpanded()) return entries;
+      if (!activityIsExpanded()) {
+        entries.forEach((entry) => { entry._activityVisibility = 1; });
+        return entries;
+      }
       const viewport = activityScroller.getBoundingClientRect();
-      return entries.filter((entry) => {
+      entries.forEach((entry) => {
         const rect = entry.getBoundingClientRect();
-        return rect.bottom > viewport.top && rect.top < viewport.bottom;
+        const height = Math.max(0, rect.bottom - rect.top);
+        const visible = Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top));
+        entry._activityVisibility = height ? Math.max(0, Math.min(1, visible / height)) : 0;
       });
+      return entries.filter((entry) => entry._activityVisibility > 0);
     }
 
     function syncActivityOverviewScroll() {
       const track = activityOverview.querySelector('.activity-overview-track');
       if (!track) return;
-      const width = activityOverview.clientWidth;
-      const travel = activityIsExpanded() ? Math.min(96, width * 0.22) : 0;
-      const scrollRange = Math.max(0, activityScroller.scrollHeight - activityScroller.clientHeight);
-      const progress = scrollRange ? Math.max(0, Math.min(1, activityScroller.scrollTop / scrollRange)) : 0;
-      track.style.width = width + travel + 'px';
-      track.style.transform = 'translateX(' + (-progress * travel) + 'px)';
+      track.style.width = activityOverview.clientWidth + 'px';
+      track.style.transform = 'none';
     }
 
     function scheduleActivityOverview() {
@@ -3437,7 +3504,7 @@ _HTML = r"""<!doctype html>
 
     function drawActivityOverview() {
       activityOverview.replaceChildren();
-      const segments = activityPhaseSegments(activityEntriesInView());
+      const segments = activitySegmentWeights(activityPhaseSegments(activityEntriesInView()));
       if (!segments.length) {
         const empty = document.createElement('span');
         empty.className = 'activity-overview-empty';
@@ -3450,7 +3517,8 @@ _HTML = r"""<!doctype html>
       for (const segment of segments) {
         const bar = document.createElement('span');
         bar.className = 'activity-segment kind-' + segment.kind;
-        bar.style.flexGrow = String(segment.duration);
+        if (segment.weight <= 0) continue;
+        bar.style.flexGrow = String(segment.weight);
         bar.title = segment.label + ' · ' + segment.kind + ' · ' + formatActivityDuration(segment.duration);
         track.appendChild(bar);
       }
@@ -3479,12 +3547,13 @@ _HTML = r"""<!doctype html>
 
     function addActivityEntry(kind, title, options = {}) {
       activityEmpty.hidden = true;
-      finalizeOpenActivities();
+      const startedAt = Number(options.startedAt) || Date.now();
+      finalizeOpenActivities(startedAt);
       const entry = document.createElement("li");
       entry.className = "activity-entry kind-" + kind;
       entry._activityPhases = [];
       entry._activityTitle = title;
-      entry.dataset.startedAt = String(Date.now());
+      entry.dataset.startedAt = String(startedAt);
       if (options.status) entry.dataset.status = String(options.status).toLowerCase();
 
       const marker = document.createElement("span");
@@ -3527,6 +3596,7 @@ _HTML = r"""<!doctype html>
       entry.appendChild(card);
 
       activityLog.appendChild(entry);
+      beginActivityPhase(entry, kind, startedAt);
       if (options.detail !== undefined || options.command !== undefined) {
         updateActivityEntry(entry, { detail: options.detail, command: options.command });
       }
@@ -3567,7 +3637,10 @@ _HTML = r"""<!doctype html>
         status.textContent = options.status;
         status.className = "activity-status " + activityStatusTone(options.status);
         entry.dataset.status = String(options.status || "").toLowerCase();
-        if (activityStatusIsFinished(options.status)) markActivityEnded(entry);
+        if (activityStatusIsFinished(options.status)) {
+          endActivityPhase(entry);
+          markActivityEnded(entry);
+        }
       }
       if (options.meta !== undefined && meta) {
         meta.textContent = options.meta;
@@ -3632,6 +3705,7 @@ _HTML = r"""<!doctype html>
       activityStepEntries.clear();
       activityToolEntries.clear();
       currentActivityStep = null;
+      currentActivityThinking = null;
       currentActivityStepNumber = null;
       activityLiveText = "";
       activityReasoningText = "";
@@ -3679,6 +3753,25 @@ _HTML = r"""<!doctype html>
       return entry;
     }
 
+    function ensureActivityThinking(step, timestamp = Date.now()) {
+      if (currentActivityThinking && !currentActivityThinking.dataset.endedAt) return currentActivityThinking;
+      const stepNumber = Number(step || currentActivityStepNumber) || activityState.steps.size || 1;
+      currentActivityThinking = addActivityEntry('thinking', 'Thinking', {
+        detail: 'Step ' + stepNumber + ' is reasoning about the next response.',
+        status: 'thinking',
+        meta: 'step ' + stepNumber,
+        startedAt: timestamp,
+      });
+      return currentActivityThinking;
+    }
+
+    function finishActivityThinking(timestamp = Date.now()) {
+      if (!currentActivityThinking) return;
+      endActivityPhase(currentActivityThinking, timestamp);
+      updateActivityEntry(currentActivityThinking, { status: 'complete' });
+      currentActivityThinking = null;
+    }
+
     function updateActivityStep(step, options = {}) {
       const stepNumber = Number(step);
       let entry = Number.isFinite(stepNumber) ? activityStepEntries.get(stepNumber) : currentActivityStep;
@@ -3689,6 +3782,7 @@ _HTML = r"""<!doctype html>
 
     function addToolActivity(event) {
       const toolCallId = event.tool_call_id || "";
+      finishActivityThinking(activityEventTime(event));
       if (toolCallId && activityToolEntries.has(toolCallId)) return activityToolEntries.get(toolCallId);
       const entry = addActivityEntry("tool", "Bash command", {
         marker: "→",
@@ -3697,6 +3791,7 @@ _HTML = r"""<!doctype html>
         meta: currentActivityStepNumber ? "step " + currentActivityStepNumber : "",
       });
       entry.dataset.startedAt = String(activityEventTime(event));
+      entry._activityPhases = [];
       beginActivityPhase(entry, "tool", activityEventTime(event));
       if (toolCallId) {
         entry.dataset.toolCallId = toolCallId;
@@ -3742,6 +3837,7 @@ _HTML = r"""<!doctype html>
 
     function finalizeActivity(event) {
       const exitStatus = event.exit_status || "done";
+      finishActivityThinking(activityEventTime(event));
       activityStepEntries.forEach((entry) => endActivityPhase(entry, activityEventTime(event)));
       activityToolEntries.forEach((entry) => endActivityPhase(entry, activityEventTime(event)));
       const successful = exitStatus === "Submitted";
@@ -4003,7 +4099,21 @@ _HTML = r"""<!doctype html>
         codeLanguage = '';
       }
 
-      for (const line of lines) {
+      function markdownTableCells(line) {
+        let value = String(line).trim();
+        if (value.startsWith('|')) value = value.slice(1);
+        if (value.endsWith('|')) value = value.slice(0, -1);
+        return value.split('|').map((cell) => cell.trim());
+      }
+
+      function isMarkdownTableDivider(line) {
+        if (line === undefined || !line.includes('|')) return false;
+        const cells = markdownTableCells(line);
+        return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+      }
+
+      for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const line = lines[lineIndex];
         const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
         if (codeLines !== null) {
           if (fence) flushCode();
@@ -4022,6 +4132,25 @@ _HTML = r"""<!doctype html>
           flushParagraph();
           flushQuote();
           closeList();
+          continue;
+        }
+        if (line.includes('|') && isMarkdownTableDivider(lines[lineIndex + 1])) {
+          flushParagraph();
+          flushQuote();
+          closeList();
+          const headers = markdownTableCells(line);
+          html.push('<table>');
+          html.push('<thead><tr>' + headers.map((cell) => '<th>' + renderMarkdownInline(cell) + '</th>').join('') + '</tr></thead>');
+          html.push('<tbody>');
+          lineIndex += 1;
+          while (lineIndex + 1 < lines.length) {
+            const row = lines[lineIndex + 1];
+            if (!row.trim() || !row.includes('|')) break;
+            lineIndex += 1;
+            const cells = markdownTableCells(row);
+            html.push('<tr>' + headers.map((_, cellIndex) => '<td>' + renderMarkdownInline(cells[cellIndex] || '') + '</td>').join('') + '</tr>');
+          }
+          html.push('</tbody></table>');
           continue;
         }
         const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
@@ -4988,6 +5117,7 @@ _HTML = r"""<!doctype html>
       }
       switch (event.type) {
         case "run_start":
+          currentActivityThinking = null;
           if (!replayingHistory) {
             runTokenUsage = { prompt: 0, completion: 0, total: 0 };
           }
@@ -5044,15 +5174,16 @@ _HTML = r"""<!doctype html>
           ensureAssistantCard();
           if (currentActivityStepNumber) {
             updateActivityStep(currentActivityStepNumber, {
-              title: "Step " + currentActivityStepNumber + " · Thinking",
-              detail: "Receiving the model response…",
-              status: "thinking",
+              detail: 'Receiving the model response…',
+              status: 'thinking',
             });
           }
-          beginActivityPhase(currentActivityStep, "thinking", activityEventTime(event));
+          ensureActivityThinking(currentActivityStepNumber, activityEventTime(event));
           break;
         case "assistant_delta": {
-          beginActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, "reply", activityEventTime(event));
+          const timestamp = activityEventTime(event);
+          finishActivityThinking(timestamp);
+          beginActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, 'reply', timestamp);
           const card = ensureAssistantCard();
           activityLiveText += event.text || "";
           appendText(card, event.text || "");
@@ -5066,7 +5197,7 @@ _HTML = r"""<!doctype html>
           break;
         }
         case "reasoning_delta": {
-          beginActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, "thinking", activityEventTime(event));
+          const thinkingEntry = ensureActivityThinking(event.step || currentActivityStepNumber, activityEventTime(event));
           const card = ensureAssistantCard();
           if (!currentReasoning) {
             const details = document.createElement("details");
@@ -5083,10 +5214,9 @@ _HTML = r"""<!doctype html>
           currentReasoning.textContent += event.text || "";
           activityReasoningText += event.text || "";
           if (!activityLiveText.trim() && activityReasoningText.trim()) {
-            updateActivityStep(event.step || currentActivityStepNumber, {
-              title: "Step " + (event.step || currentActivityStepNumber || "?") + " · Reasoning",
+            updateActivityEntry(thinkingEntry, {
               detail: previewText(activityReasoningText, 220),
-              status: "thinking",
+              status: 'thinking',
             });
           }
           break;
@@ -5095,9 +5225,11 @@ _HTML = r"""<!doctype html>
           if (!currentAssistant) ensureAssistantCard();
           break;
         case "assistant_end":
+          finishActivityThinking(activityEventTime(event));
           endActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, activityEventTime(event));
           break;
         case "assistant_message": {
+          finishActivityThinking(activityEventTime(event));
           endActivityPhase(activityStepEntries.get(Number(event.step || currentActivityStepNumber)) || currentActivityStep, activityEventTime(event));
           const card = ensureAssistantCard();
           if (event.content) {
@@ -5163,6 +5295,7 @@ _HTML = r"""<!doctype html>
         case "observation":
           break;
         case "format_error": {
+          finishActivityThinking(activityEventTime(event));
           endActivityPhase(currentActivityStep, activityEventTime(event));
           currentAssistant = null;
           currentReasoning = null;
@@ -5187,7 +5320,8 @@ _HTML = r"""<!doctype html>
           updateActivitySummary();
           break;
         }
-        case "error": {
+        case error: {
+          finishActivityThinking(activityEventTime(event));
           currentAssistant = null;
           currentReasoning = null;
           activityLiveText = "";
@@ -5271,9 +5405,13 @@ _HTML = r"""<!doctype html>
         try { handleEvent(JSON.parse(message.data)); }
         catch (err) { console.error("Bad event", err, message.data); }
       };
-      source.onerror = () => {
+      source.onerror = async () => {
         if (eventSource !== source) return;
         closeEventStream();
+        // The stream can close at the same moment the run finishes. Refresh the
+        // server summaries before claiming the connection was lost, otherwise a
+        // completed run is reported as an error.
+        await loadConversations();
         const conversation = conversations.find((item) => conversationId(item) === sessionId);
         if (conversation && !conversation.done) {
           setStatus("disconnected", "error");
@@ -5284,12 +5422,9 @@ _HTML = r"""<!doctype html>
           activityState.errors += 1;
           markActivityFinished(true);
         } else if (conversation) {
-          // Replaying historical events can leave the header at "running" when
-          // the stored run ended without a terminal event (for example after a
-          // server restart). The summary is authoritative for finished runs.
+          // The summary is authoritative for finished runs.
           applyConversationStatus(conversation);
         }
-        loadConversations();
       };
     }
 

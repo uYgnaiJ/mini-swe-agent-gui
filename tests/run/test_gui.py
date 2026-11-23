@@ -1065,6 +1065,8 @@ def test_gui_conversation_markdown_is_safe_and_preserves_raw_source():
     assert "stripCommandFromAssistantContent(markdownSource(contentEl), command)" in _HTML
     assert "content.textContent = event.content;" not in _HTML
     assert ".content.markdown pre" in _HTML
+    assert "background: var(--code-bg); color: var(--code-text);" in _HTML
+    assert ".content.markdown table" in _HTML
 
     if shutil.which("node") is None:
         pytest.skip("Node.js is needed to execute the embedded Markdown renderer")
@@ -1082,6 +1084,10 @@ const source = [
   '- one',
   '- two',
   '',
+  '| Path | Role |',
+  '| --- | --- |',
+  '| `src/` | **Agent** |',
+  '',
   '```html',
   '<img src=x onerror=alert(1)>',
   '```',
@@ -1091,6 +1097,9 @@ const source = [
   '<script>alert(1)</script>'
 ].join('\n');
 const rendered = markdownToHtml(source);
+assert.ok(rendered.includes('<thead><tr><th>Path</th><th>Role</th></tr></thead>'));
+assert.ok(rendered.includes('<tr><td><code>src/</code></td><td><strong>Agent</strong></td></tr>'));
+assert.ok(!rendered.includes('| --- | --- |'));
 assert.ok(rendered.includes('<h1>Heading</h1>'));
 assert.ok(rendered.includes('<strong>bold</strong> and <em>em</em>'));
 assert.ok(rendered.includes('<code>x &lt; y</code>'));
@@ -1511,7 +1520,10 @@ def test_gui_activity_phase_durations_and_timestamp_persistence(tmp_path):
     from minisweagent.run.gui import _HTML
 
     assert "activity-legend" not in _HTML
-    assert "bar.style.flexGrow = String(segment.duration);" in _HTML
+    assert "bar.style.flexGrow = String(segment.weight);" in _HTML
+    assert "beginActivityPhase(entry, kind, startedAt);" in _HTML
+    assert "function ensureActivityThinking" in _HTML
+    assert "addActivityEntry('thinking', 'Thinking'" in _HTML
     assert ".activity-segment.kind-thinking" in _HTML
     assert ".activity-segment.kind-reply" in _HTML
     assert ".activity-segment.kind-tool" in _HTML
@@ -1524,10 +1536,14 @@ def test_gui_activity_phase_durations_and_timestamp_persistence(tmp_path):
 const assert = require('node:assert/strict');
 const entries = [
   {
+    hidden: false, _activityTitle: 'Thinking',
+    _activityPhases: [{ kind: 'thinking', startedAt: 0, endedAt: 1000 }]
+  },
+  {
     hidden: false, _activityTitle: 'Step 1',
     _activityPhases: [
-      { kind: 'thinking', startedAt: 0, endedAt: 1000 },
-      { kind: 'reply', startedAt: 1000, endedAt: 3500 }
+      { kind: 'step', startedAt: 1000, endedAt: 1200 },
+      { kind: 'reply', startedAt: 1200, endedAt: 3500 }
     ]
   },
   {
@@ -1540,9 +1556,30 @@ const entries = [
   }
 ];
 const segments = activityPhaseSegments(entries);
+assert.equal(segments.length, entries.filter((entry) => !entry.hidden).length);
 assert.deepEqual(segments.map((segment) => segment.kind), ['thinking', 'reply', 'tool']);
 assert.deepEqual(segments.map((segment) => segment.duration), [1000, 2500, 3500]);
 assert.ok(!segments.some((segment) => segment.label === 'Hidden command'));
+const weighted = activitySegmentWeights([
+  { kind: 'thinking', duration: 100, visibility: 1, ongoing: false },
+  { kind: 'tool', duration: 9850, visibility: 1, ongoing: false },
+  { kind: 'done', duration: 50, visibility: 1, ongoing: false }
+]);
+assert.deepEqual(weighted.map((segment) => segment.weight), [0.1, 0.8, 0.1]);
+const liveEntry = {
+  hidden: false, _activityTitle: 'Live command', _activityVisibility: 1,
+  _activityPhases: [{ kind: 'tool', startedAt: 1000, endedAt: 0 }]
+};
+const live = activitySegmentWeights(activityPhaseSegments([liveEntry], 2000));
+assert.equal(live.length, 1);
+assert.equal(live[0].kind, 'running');
+assert.equal(live[0].duration, 1000);
+assert.equal(live[0].weight, 0.1);
+liveEntry._activityPhases[0].endedAt = 2000;
+const finished = activitySegmentWeights(activityPhaseSegments([liveEntry], 3000));
+assert.equal(finished[0].kind, 'tool');
+assert.equal(finished[0].duration, 1000);
+assert.equal(finished[0].weight, 1);
 """
     completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
@@ -1572,11 +1609,19 @@ const track = { style: {} };
 global.activityOverview = { clientWidth: 300, querySelector: () => track };
 activityScroller = { scrollHeight: 1000, clientHeight: 200, scrollTop: 400 };
 syncActivityOverviewScroll();
-assert.equal(track.style.width, '366px');
-assert.equal(track.style.transform, 'translateX(-33px)');
+assert.equal(track.style.width, '300px');
+assert.equal(track.style.transform, 'none');
 activityScroller.scrollTop = 800;
 syncActivityOverviewScroll();
-assert.equal(track.style.transform, 'translateX(-66px)');
+assert.equal(track.style.transform, 'none');
+activityScroller.getBoundingClientRect = () => ({ top: 100, bottom: 200 });
+entries[0].getBoundingClientRect = () => ({ top: 60, bottom: 140 });
+activityIsExpanded = () => true;
+activityEntriesInView();
+assert.equal(entries[0]._activityVisibility, 0.5);
+entries[0].getBoundingClientRect = () => ({ top: 100, bottom: 180 });
+activityEntriesInView();
+assert.equal(entries[0]._activityVisibility, 1);
 """
     completed = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
