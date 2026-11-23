@@ -1,3 +1,4 @@
+import json
 import logging
 from copy import deepcopy
 from pathlib import Path
@@ -617,40 +618,15 @@ def test_stop_during_streaming_query_aborts_model_retry(toolcall_config):
     assert events[-1]["exit_status"] == "Stopped"
 
 
-def test_conversational_greeting_skips_tool_loop():
-    """Greetings should be answered directly instead of triggering bash searches."""
-    config = {
-        "system_template": "You are an agent.",
-        "instance_template": "Please solve this issue: {{task}}",
-    }
-    events: list[dict] = []
-    # An empty output list would raise if the agent tried to query the model.
-    agent = DefaultAgent(model=DeterministicModel(outputs=[]), env=LocalEnvironment(), **config)
-    agent.set_event_callback(events.append)
+def test_greeting_runs_the_normal_agent_loop(toolcall_config):
+    """Greetings go through the planner/tool loop instead of a canned reply."""
+    model = make_tc_model([("Hello! What would you like me to investigate?", [])], cost_per_call=0.0)
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **{**toolcall_config, "cost_limit": 0})
 
     result = agent.run("hi")
 
     assert result["exit_status"] == "Submitted"
-    assert result["submission"]
-    assert agent.n_calls == 0
-    assert [event["type"] for event in events] == ["run_start", "assistant_message", "done"]
-    assert events[1]["actions"] == []
-    assert events[1]["conversational"] is True
-
-
-def test_greeting_prefix_does_not_hide_real_task(model_factory):
-    """A greeting followed by an actual request must still run the normal agent."""
-    factory, config = model_factory
-    agent = DefaultAgent(
-        model=factory([("Done", [{"command": "echo 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT'\necho 'fixed'"}])]),
-        env=LocalEnvironment(),
-        **config,
-    )
-
-    result = agent.run("hi, please fix the failing tests")
-
-    assert result["exit_status"] == "Submitted"
-    assert result["submission"] == "fixed\n"
+    assert result["submission"] == "Hello! What would you like me to investigate?"
     assert agent.n_calls == 1
 
 
@@ -711,3 +687,129 @@ def test_continue_run_preserves_conversation_context():
     # Both user instructions are still in the agent's cumulative transcript.
     assert "first instruction" in " ".join(get_text(message) for message in agent.messages)
     assert "second instruction" in " ".join(get_text(message) for message in agent.messages)
+
+
+def _plan_json(**overrides) -> str:
+    plan = {
+        "intent": "small_edit",
+        "use_tools": True,
+        "write_files": True,
+        "reply_directly": False,
+        "steps": 2,
+        "plan": "Run two commands",
+        **overrides,
+    }
+    return json.dumps(plan)
+
+
+def _budget_config(config: dict) -> dict:
+    return {
+        **config,
+        "auto_budget": True,
+        "cost_limit": 0,
+        "step_limit": 0,
+        "min_step_budget": 2,
+        "max_budget_extensions": 1,
+    }
+
+
+def test_auto_budget_reports_at_checkpoint(toolcall_config):
+    model = make_tc_model(
+        [
+            (_plan_json(), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            (json.dumps({"status": "report", "summary": "Both commands ran.", "answer": "All done."}), []),
+        ],
+        cost_per_call=0.0,
+    )
+    events: list[dict] = []
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **_budget_config(toolcall_config))
+    agent.set_event_callback(events.append)
+
+    result = agent.run("do two small things")
+
+    assert result["exit_status"] == "Submitted"
+    assert result["submission"] == "All done."
+    assert agent.n_calls == 2
+    plan = next(event for event in events if event["type"] == "plan")
+    assert plan["steps"] == 2
+    assert plan["write_files"] is True
+    assert any(event["type"] == "budget_reached" for event in events)
+    assert "<work_plan>" in agent.messages[0]["content"]
+    assert "not a user instruction" in agent.messages[0]["content"]
+
+
+def test_auto_budget_extends_budget_then_finishes(toolcall_config):
+    model = make_tc_model(
+        [
+            (_plan_json(steps=2), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            (json.dumps({"status": "continue", "summary": "Halfway.", "next_steps": 1, "plan": "Finish"}), []),
+            (
+                "finishing",
+                [{"command": "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && echo final answer"}],
+            ),
+        ],
+        cost_per_call=0.0,
+    )
+    events: list[dict] = []
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **_budget_config(toolcall_config))
+    agent.set_event_callback(events.append)
+
+    result = agent.run("do two small things")
+
+    assert result["exit_status"] == "Submitted"
+    assert agent.n_calls == 3
+    extended = next(event for event in events if event["type"] == "budget_extended")
+    assert extended["steps"] == 2
+    assert extended["budget"] == 4
+
+
+def test_auto_budget_checkpoint_never_exceeds_hard_step_limit(toolcall_config):
+    model = make_tc_model(
+        [
+            (_plan_json(steps=2), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            (json.dumps({"status": "continue", "next_steps": 10, "plan": "Keep going"}), []),
+            ("three", [{"command": "echo three"}]),
+        ],
+        cost_per_call=0.0,
+    )
+    config = {**_budget_config(toolcall_config), "step_limit": 3}
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **config)
+
+    result = agent.run("do things")
+
+    assert result["exit_status"] == "LimitsExceeded"
+    assert agent.n_calls == 3
+
+
+def test_auto_budget_reports_summary_when_extension_cap_is_reached(toolcall_config):
+    model = make_tc_model(
+        [
+            (_plan_json(steps=2), []),
+            ("one", [{"command": "echo one"}]),
+            ("two", [{"command": "echo two"}]),
+            (
+                json.dumps({"status": "continue", "summary": "Still investigating.", "next_steps": 2, "plan": "More"}),
+                [],
+            ),
+            ("three", [{"command": "echo three"}]),
+            ("four", [{"command": "echo four"}]),
+            (
+                json.dumps({"status": "continue", "summary": "Found the problem: X.", "next_steps": 2, "plan": "Fix"}),
+                [],
+            ),
+        ],
+        cost_per_call=0.0,
+    )
+    agent = DefaultAgent(model=model, env=LocalEnvironment(), **_budget_config(toolcall_config))
+
+    result = agent.run("investigate")
+
+    assert result["exit_status"] == "Submitted"
+    assert result["submission"] == "Found the problem: X."
+    assert agent.n_calls == 4

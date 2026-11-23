@@ -19,6 +19,7 @@ from minisweagent.run.gui import (
     GuiModelSettings,
     GuiSessionManager,
     _qualified_model_name,
+    build_gui_config,
     conversation_state,
     create_server,
 )
@@ -554,26 +555,26 @@ def test_gui_restored_interrupted_conversation_has_terminal_event(tmp_path):
         manager.close()
 
 
-def test_gui_answers_greeting_without_starting_agent(tmp_path):
-    agent_factory_calls = 0
+def test_gui_greeting_runs_the_agent(tmp_path):
+    calls: list[bool] = []
 
-    def exploding_factory():
-        nonlocal agent_factory_calls
-        agent_factory_calls += 1
-        raise AssertionError("The software engineering agent must not run for a greeting")
+    def agent_factory():
+        calls.append(True)
+        return _FakeAgent()
 
     manager = GuiSessionManager(
-        GuiConfig(agent_config={}), agent_factory=exploding_factory, db_path=tmp_path / "conversations.db"
+        GuiConfig(agent_config={}), agent_factory=agent_factory, db_path=tmp_path / "conversations.db"
     )
-    session = manager.start_session("hi")
+    try:
+        session = manager.start_session("hi")
 
-    assert session.wait(timeout=5)
-    assert agent_factory_calls == 0
-    assert [event["type"] for event in session.events] == ["run_start", "assistant_message", "done"]
-    assert session.events[1]["actions"] == []
-    assert session.events[1]["conversational"] is True
-    assert session.events[-1]["exit_status"] == "Submitted"
-    assert session.summary()["state"] == "submitted"
+        assert session.wait(timeout=5)
+        assert calls == [True]
+        assert session.events[0]["type"] == "run_start"
+        assert session.events[-1]["exit_status"] == "Submitted"
+        assert session.summary()["state"] == "submitted"
+    finally:
+        manager.close()
 
 
 def test_gui_investigation_ends_with_visible_final_answer(tmp_path):
@@ -889,6 +890,52 @@ def test_provider_model_names_are_qualified_for_litellm(provider_id, model_name,
     assert _qualified_model_name(provider_id, model_name) == expected
 
 
+@pytest.mark.parametrize(
+    ("provider_id", "model_name", "base_url", "expected"),
+    [
+        (
+            "arkengine",
+            "openai/kimi-k3-1-pro-261024",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "volcengine/kimi-k3-1-pro-261024",
+        ),
+        (
+            "arkengine",
+            "doubao-seed-2-1-pro-260915",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "volcengine/doubao-seed-2-1-pro-260915",
+        ),
+        (
+            "openai",
+            "openai/kimi-k3-1-pro-261024",
+            "https://ark.cn-beijing.volces.com/api/v3",
+            "openai/kimi-k3-1-pro-261024",
+        ),
+        ("custom-gateway", "meta-llama/Llama-3", "https://api.example.com/v1", "openai/meta-llama/Llama-3"),
+    ],
+)
+def test_base_url_provider_prefix_is_used_for_litellm_model_names(provider_id, model_name, base_url, expected):
+    assert _qualified_model_name(provider_id, model_name, base_url) == expected
+
+
+def test_ark_provider_models_use_volcengine_prefix_and_cost_fallback(tmp_path):
+    manager = GuiSessionManager(
+        GuiConfig(agent_config={"model": {}}),
+        agent_factory=_FakeAgent,
+        db_path=tmp_path / "conversations.db",
+    )
+    base_url = "https://ark.cn-beijing.volces.com/api/v3"
+    manager.model_settings.add_provider({"id": "arkengine", "name": "arkengine", "base_url": base_url})
+    manager.model_settings.add_model({"model_name": "openai/kimi-k3-1-pro-261024", "provider": "arkengine"})
+
+    config = manager._config_for_model("openai/kimi-k3-1-pro-261024")
+
+    assert config.model_name == "volcengine/kimi-k3-1-pro-261024"
+    assert config.agent_config["model"]["cost_tracking"] == "ignore_errors"
+    assert config.agent_config["model"]["model_kwargs"]["api_base"] == base_url
+    manager.close()
+
+
 def test_loading_provider_models_qualifies_names_and_upgrades_existing_models(tmp_path, monkeypatch):
     settings = GuiModelSettings(tmp_path / "gui_settings.json")
     settings.add_provider({"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1"})
@@ -910,6 +957,52 @@ def test_loading_provider_models_qualifies_names_and_upgrades_existing_models(tm
     assert snapshot["active_model"] == "openai/gpt-4o-mini"
     assert snapshot["fetched_models"] == ["gpt-4o-mini", "gpt-4.1"]
     assert [model["model_name"] for model in snapshot["loaded_models"]] == ["openai/gpt-4.1"]
+
+
+def test_gui_config_enables_auto_budget_by_default(tmp_path):
+    config = build_gui_config(config_spec=[str(Path("src/minisweagent/config/mini.yaml"))])
+    assert config.agent_config["agent"]["auto_budget"] is True
+    assert config.agent_config["agent"]["mode"] == "yolo"
+
+
+def test_gui_replays_every_turn_before_closing_the_event_stream():
+    """A finished conversation has one `done` per turn; replay must not stop at the first."""
+    from minisweagent.run.gui import _HTML
+
+    assert "replayingHistory = true" in _HTML
+    assert "if (!replayingHistory) closeEventStream();" in _HTML
+
+
+def test_mini_config_does_not_frame_requests_as_bug_reports():
+    agent_config = yaml.safe_load(Path("src/minisweagent/config/mini.yaml").read_text())["agent"]
+    instance_template = agent_config["instance_template"]
+    assert "Please solve this issue" not in instance_template
+    assert "Submit your changes" not in instance_template
+    assert "How to proceed" not in instance_template
+    assert instance_template.strip() == "User request:\n<request>\n{{task}}\n</request>"
+    assert "How to proceed" in agent_config["system_template"]
+
+
+def test_gui_config_respects_explicit_auto_budget_override(tmp_path):
+    config = build_gui_config(config_spec=["agent.auto_budget=false"])
+    assert config.agent_config["agent"]["auto_budget"] is False
+
+
+def test_reloading_ark_models_upgrades_existing_openai_prefixed_names(tmp_path, monkeypatch):
+    settings = GuiModelSettings(tmp_path / "gui_settings.json")
+    settings.add_provider(
+        {"id": "arkengine", "name": "arkengine", "base_url": "https://ark.cn-beijing.volces.com/api/v3"}
+    )
+    settings.add_model({"model_name": "openai/kimi-k3-1-pro-261024", "provider": "arkengine"})
+    monkeypatch.setattr(
+        "minisweagent.run.gui._query_provider_models",
+        lambda provider, *, timeout=15.0: [{"model_name": "kimi-k3-1-pro-261024", "name": "Kimi K3"}],
+    )
+
+    snapshot = settings.load_provider_models("arkengine")
+
+    assert [model["model_name"] for model in snapshot["enabled_models"]] == ["volcengine/kimi-k3-1-pro-261024"]
+    assert snapshot["loaded_models"] == []
 
 
 def test_model_config_adds_provider_prefix_when_calling_existing_raw_model_name(tmp_path):

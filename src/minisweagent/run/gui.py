@@ -38,7 +38,6 @@ from rich.console import Console
 
 from minisweagent import global_config_dir
 from minisweagent.agents import get_agent
-from minisweagent.agents.utils.conversation import conversational_reply
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.exceptions import UserInterruption
@@ -102,6 +101,11 @@ _PROVIDER_MODEL_PREFIXES: dict[str, str] = {
     "cohere": "cohere",
 }
 
+# Fallbacks for providers that are configured by base URL instead of a known id.
+_BASE_URL_MODEL_PREFIXES: dict[str, str] = {
+    "volces.com": "volcengine",
+}
+
 
 def _slugify(value: Any) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
@@ -138,12 +142,35 @@ def _provider_from_model(model_name: str) -> str:
     return _slugify(value.split("-", 1)[0])
 
 
-def _qualified_model_name(provider_id: str, model_name: str) -> str:
+def _provider_model_prefix(provider_id: str, base_url: str = "") -> str:
+    """Return the LiteLLM provider prefix for a provider id or its API base URL.
+
+    Provider ids registered in ``_PROVIDER_MODEL_PREFIXES`` win. Otherwise the
+    base URL is inspected, so providers configured only by URL (for example
+    VolcEngine Ark at ``ark.cn-beijing.volces.com``) still get the prefix that
+    LiteLLM's model registry uses for pricing.
+    """
+    slug = _slugify(provider_id)
+    if slug in _PROVIDER_MODEL_PREFIXES:
+        return _PROVIDER_MODEL_PREFIXES[slug]
+    host = (urlparse(str(base_url or "")).hostname or "").lower()
+    for domain, prefix in _BASE_URL_MODEL_PREFIXES.items():
+        if host == domain or host.endswith(f".{domain}"):
+            return prefix
+    return "openai"
+
+
+def _qualified_model_name(provider_id: str, model_name: str, base_url: str = "") -> str:
     """Add the provider prefix LiteLLM needs to a provider-local model name."""
     name = str(model_name or "").strip()
     if not name:
         return name
-    prefix = _PROVIDER_MODEL_PREFIXES.get(_slugify(provider_id), "openai")
+    prefix = _provider_model_prefix(provider_id, base_url)
+    if _slugify(provider_id) not in _PROVIDER_MODEL_PREFIXES and name.startswith("openai/"):
+        # Models discovered before the base URL was known were stored with the
+        # generic openai/ prefix; replace it with the provider-specific one so
+        # LiteLLM can find pricing information.
+        name = name.removeprefix("openai/")
     return name if name == prefix or name.startswith(f"{prefix}/") else f"{prefix}/{name}"
 
 
@@ -592,15 +619,29 @@ class GuiModelSettings:
             added: list[dict[str, Any]] = []
             for choice in discovered:
                 discovered_name = str(choice.get("model_name") or "").strip()
-                model_name = _qualified_model_name(provider["id"], discovered_name)
+                model_name = _qualified_model_name(provider["id"], discovered_name, provider.get("base_url", ""))
                 if not model_name or model_name in existing:
                     continue
                 legacy_model = existing.get(discovered_name)
+                if legacy_model is None:
+                    # Models stored before the provider prefix could be derived
+                    # still carry a different prefix (e.g. openai/ instead of
+                    # volcengine/); upgrade them instead of adding a duplicate.
+                    legacy_model = next(
+                        (
+                            model
+                            for model in existing.values()
+                            if model.get("provider") == provider["id"]
+                            and str(model.get("model_name") or "").rsplit("/", 1)[-1] == discovered_name
+                        ),
+                        None,
+                    )
                 if legacy_model is not None and legacy_model.get("provider") == provider["id"]:
                     # Upgrade models loaded before names were provider-qualified.
+                    legacy_key = str(legacy_model.get("model_name") or "")
                     legacy_model["id"] = model_name
                     legacy_model["model_name"] = model_name
-                    existing.pop(discovered_name)
+                    existing.pop(legacy_key, None)
                     existing[model_name] = legacy_model
                     continue
                 model = self._normalize_model(
@@ -2264,6 +2305,7 @@ _HTML = r"""<!doctype html>
     const SESSION_STORAGE_KEY = "mini-swe-agent-session";
     let eventSource = null;
     let activeSessionId = null;
+    let replayingHistory = false;
     let selectedSessionId = null;
     let conversations = [];
     let defaultWorkspace = "";
@@ -3516,6 +3558,7 @@ _HTML = r"""<!doctype html>
       }
       const meta = [
         event.n_calls != null ? event.n_calls + " calls" : "",
+        event.calls_without_cost ? event.calls_without_cost + " without cost data" : "",
         event.cost != null ? "$" + Number(event.cost).toFixed(4) : "",
         (event.total_tokens ?? event.tokens) != null ? formatTokens(event.total_tokens ?? event.tokens) + " tokens" : "",
       ].filter(Boolean).join(" · ");
@@ -4127,6 +4170,9 @@ _HTML = r"""<!doctype html>
       renderConversationList();
       resetRunView(conversation || { session_id: sessionId });
       if (!conversation) setStatus("loading", "running");
+      // Historical conversations contain one `done` event per turn.  Do not let
+      // the first one close the stream before later turns have been replayed.
+      replayingHistory = true;
       connectEvents(sessionId);
     }
 
@@ -4151,6 +4197,36 @@ _HTML = r"""<!doctype html>
             detail: event.task ? previewText(event.task, 180) : "Agent run accepted.",
             status: "running",
             segment: true,
+          });
+          break;
+        case "plan": {
+          const planBits = [
+            event.intent ? String(event.intent).replace(/_/g, " ") : "",
+            event.reply_directly ? "direct answer" : event.write_files ? "writes files" : "read-only",
+            event.steps ? "budget " + event.steps + " steps" : "",
+          ].filter(Boolean).join(" · ");
+          addActivityEntry("plan", "Plan", {
+            marker: "◎",
+            detail: previewText(event.plan || "Planner unavailable; using the default step budget.", 220),
+            status: "planned",
+            meta: planBits,
+          });
+          break;
+        }
+        case "budget_reached":
+          addActivityEntry("plan", "Step budget reached", {
+            marker: "‖",
+            detail: "Used " + event.budget + " steps. Summarizing the work before deciding whether to continue.",
+            status: "checkpoint",
+            meta: event.budget + " steps",
+          });
+          break;
+        case "budget_extended":
+          addActivityEntry("plan", "Continuing with a new plan", {
+            marker: "↻",
+            detail: previewText(event.plan || event.summary || "Continuing the task.", 220),
+            status: "running",
+            meta: "+" + event.steps + " steps (budget " + event.budget + ")",
           });
           break;
         case "step_start":
@@ -4223,8 +4299,11 @@ _HTML = r"""<!doctype html>
             content.textContent = event.content;
           }
           const callTokens = updateTokenStatsFromAssistant(event);
-          const currentCost = Number(statCost.textContent.replace("$", "")) || 0;
-          statCost.textContent = "$" + (currentCost + Number(event.cost || 0)).toFixed(4);
+          const callCostKnown = event.cost_known !== false;
+          if (callCostKnown) {
+            const currentCost = Number(statCost.textContent.replace("$", "")) || 0;
+            statCost.textContent = "$" + (currentCost + Number(event.cost || 0)).toFixed(4);
+          }
           const actions = Array.isArray(event.actions) ? event.actions : [];
           const activityTitle = "Step " + (event.step || currentActivityStepNumber || "?") + " · "
             + (actions.length ? "Command" + (actions.length === 1 ? "" : "s") + " requested" : "Model response");
@@ -4233,7 +4312,7 @@ _HTML = r"""<!doctype html>
           const activityMeta = [
             callTokens ? formatTokens(callTokens) + " tokens" : "",
             event.total_tokens_used != null ? formatTokens(event.total_tokens_used) + " cumulative" : "",
-            "$" + Number(event.cost || 0).toFixed(4),
+            callCostKnown ? "$" + Number(event.cost || 0).toFixed(4) : "no cost data",
           ].filter(Boolean).join(" · ");
           updateActivityStep(event.step || currentActivityStepNumber, {
             title: activityTitle,
@@ -4350,7 +4429,7 @@ _HTML = r"""<!doctype html>
               total_tokens: currentTokenUsage.total,
             },
           });
-          closeEventStream();
+          if (!replayingHistory) closeEventStream();
           setComposerRunning(false);
           setTimeout(() => loadConversations(), 250);
           break;
@@ -4460,6 +4539,7 @@ _HTML = r"""<!doctype html>
         }
         renderConversationList();
         setComposerRunning(true);
+        replayingHistory = false;
         connectEvents(sessionId, Number(data.event_offset || 0));
         setTimeout(() => loadConversations(), 250);
       } catch (err) {
@@ -4681,6 +4761,9 @@ def build_gui_config(
         }
     )
     config = recursive_merge(*configs)
+    # The GUI cannot ask the user to intervene mid-run, so the agent classifies
+    # each request and negotiates its own step budget before using tools.
+    config.setdefault("agent", {}).setdefault("auto_budget", True)
     return GuiConfig(
         agent_config=config,
         initial_task=initial_task,
@@ -5102,56 +5185,6 @@ class GuiSession:
             "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
         try:
-            reply = conversational_reply(self.current_task)
-            if reply is not None and not self.current_images:
-                agent_config = self.config.agent_config.get("agent", {})
-                custom_reply = str(agent_config.get("conversational_response") or "").strip()
-                reply = custom_reply or reply
-                zero_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                self.emit(
-                    {
-                        "type": "run_start",
-                        "task": self.current_task,
-                        "images": list(self.current_images),
-                        "model_name": self.model_name,
-                        "step_limit": agent_config.get("step_limit", 0),
-                        "cost_limit": agent_config.get("cost_limit", 0.0),
-                    }
-                )
-                self.emit(
-                    {
-                        "type": "assistant_message",
-                        "content": reply,
-                        "actions": [],
-                        "cost": 0.0,
-                        "step": 0,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                        "tokens": 0,
-                        "usage": zero_usage,
-                        "total_prompt_tokens": 0,
-                        "total_completion_tokens": 0,
-                        "total_tokens_used": 0,
-                        "cumulative_usage": zero_usage,
-                        "conversational": True,
-                    }
-                )
-                self.emit(
-                    {
-                        "type": "done",
-                        "exit_status": "Submitted",
-                        "submission": reply,
-                        "cost": 0.0,
-                        "n_calls": 0,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                        "tokens": 0,
-                        "token_usage": zero_usage,
-                    }
-                )
-                return
             # A follow-up starts with a fresh model/environment so model
             # switches and per-turn limits work, but it must carry the complete
             # transcript from all previous turns.  Without this, each user
@@ -5336,7 +5369,7 @@ class GuiSessionManager:
         if provider is not None:
             model_class = str(model_entry.get("model_class") or "")
             if not model_class or "litellm" in model_class.lower():
-                qualified_name = _qualified_model_name(provider_id, model_name)
+                qualified_name = _qualified_model_name(provider_id, model_name, provider.get("base_url", ""))
                 model_config["model_name"] = qualified_name
                 config.model_name = qualified_name
             model_kwargs = model_config.setdefault("model_kwargs", {})
@@ -5350,6 +5383,10 @@ class GuiSessionManager:
                     # from the environment.  GUI-managed keys should behave the
                     # same way for every model class.
                     os.environ[api_key_env] = str(provider["api_key"])
+            # Provider-discovered models are usually not in LiteLLM's pricing
+            # registry, so fall back to recording the call without cost instead
+            # of aborting the run.  Known models still report real costs.
+            model_config.setdefault("cost_tracking", "ignore_errors")
         return config
 
     def _agent_factory_for_model(self, model_name: str) -> Callable[[], Any] | None:

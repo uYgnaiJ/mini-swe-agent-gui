@@ -1,14 +1,17 @@
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal
 
 import litellm
 from pydantic import BaseModel
 
+from minisweagent import global_config_dir
 from minisweagent.exceptions import FormatError
 from minisweagent.models import GLOBAL_MODEL_STATS
 from minisweagent.models.utils.actions_toolcall import (
@@ -23,6 +26,84 @@ from minisweagent.models.utils.openai_multimodal import expand_multimodal_conten
 from minisweagent.models.utils.retry import retry
 
 logger = logging.getLogger("litellm_model")
+
+# Cache for models that LiteLLM cannot price. The lookup is deterministic for a
+# given (model, provider endpoint, registry, LiteLLM version), so re-running it
+# for every conversation only wastes time and repeats the same warning.
+_UNPRICED_CACHE_PATH = Path(os.getenv("MSWEA_PRICING_CACHE_PATH") or global_config_dir / "unpriced_models.json")
+_UNPRICED_CACHE_VERSION = 1
+_unpriced_cache_lock = threading.RLock()
+_unpriced_cache: set[str] | None = None
+
+try:
+    _LITELLM_VERSION = version("litellm")
+except PackageNotFoundError:
+    _LITELLM_VERSION = "unknown"
+
+_UNPRICED_ERROR_MARKERS = (
+    "isn't mapped",
+    "is not mapped",
+    "not mapped yet",
+    "not registered",
+    "model_prices_and_context_window",
+    "no pricing",
+    "missing pricing",
+    "cost must be > 0.0",
+)
+
+
+def _pricing_cache_key(model_name: str, api_base: str, registry: Path | str | None) -> str:
+    """Identify a pricing lookup so provider/model changes invalidate the cache."""
+    parts = [str(model_name), str(api_base or "")]
+    if registry:
+        registry_path = Path(registry)
+        parts.append(registry_path.as_posix())
+        try:
+            parts.append(str(registry_path.stat().st_mtime_ns))
+        except OSError:
+            pass
+    parts.append(f"litellm={_LITELLM_VERSION}")
+    return "|".join(parts)
+
+
+def _load_unpriced_cache() -> set[str]:
+    global _unpriced_cache
+    with _unpriced_cache_lock:
+        if _unpriced_cache is None:
+            try:
+                payload = json.loads(_UNPRICED_CACHE_PATH.read_text(encoding="utf-8"))
+                _unpriced_cache = {str(key) for key in payload.get("keys", [])}
+            except (OSError, ValueError, TypeError, AttributeError):
+                _unpriced_cache = set()
+        return _unpriced_cache
+
+
+def _save_unpriced_cache() -> None:
+    with _unpriced_cache_lock:
+        if _unpriced_cache is None:
+            return
+        try:
+            _UNPRICED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _UNPRICED_CACHE_PATH.write_text(
+                json.dumps({"version": _UNPRICED_CACHE_VERSION, "keys": sorted(_unpriced_cache)}, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            logger.debug("Could not persist the unpriced model cache", exc_info=True)
+
+
+def _remember_unpriced(key: str) -> None:
+    with _unpriced_cache_lock:
+        cache = _load_unpriced_cache()
+        if key in cache:
+            return
+        cache.add(key)
+        _save_unpriced_cache()
+
+
+def _looks_like_missing_pricing(error: object) -> bool:
+    message = str(error).lower()
+    return any(marker in message for marker in _UNPRICED_ERROR_MARKERS)
 
 
 class LitellmModelConfig(BaseModel):
@@ -62,6 +143,7 @@ class LitellmModel:
 
     def __init__(self, *, config_class: Callable = LitellmModelConfig, **kwargs):
         self.config = config_class(**kwargs)
+        self._missing_cost_warned = False
         if self.config.litellm_model_registry and Path(self.config.litellm_model_registry).is_file():
             litellm.utils.register_model(json.loads(Path(self.config.litellm_model_registry).read_text()))
 
@@ -206,25 +288,54 @@ class LitellmModel:
         }
         return message
 
-    def _calculate_cost(self, response) -> dict[str, float]:
-        try:
-            cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
-            if cost <= 0.0:
-                raise ValueError(f"Cost must be > 0.0, got {cost}")
-        except Exception as e:
-            cost = 0.0
-            if self.config.cost_tracking != "ignore_errors":
-                msg = (
-                    f"Error calculating cost for model {self.config.model_name}: {e}, perhaps it's not registered? "
-                    "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
-                    "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
-                    "Alternatively check the 'Cost tracking' section in the documentation at "
-                    "https://klieret.short.gy/mini-local-models. "
-                    " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
-                )
-                logger.critical(msg)
-                raise RuntimeError(msg) from e
-        return {"cost": cost}
+    def _pricing_cache_key(self) -> str:
+        return _pricing_cache_key(
+            self.config.model_name,
+            str(self.config.model_kwargs.get("api_base") or ""),
+            self.config.litellm_model_registry,
+        )
+
+    def _calculate_cost(self, response) -> dict[str, Any]:
+        cache_key = self._pricing_cache_key()
+        cached = cache_key in _load_unpriced_cache()
+        error: Exception | None = None
+        if not cached:
+            try:
+                cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
+                if cost > 0.0:
+                    return {"cost": cost, "cost_known": True}
+                error = ValueError(f"Cost must be > 0.0, got {cost}")
+            except Exception as e:
+                error = e
+            if _looks_like_missing_pricing(error):
+                _remember_unpriced(cache_key)
+        else:
+            error = RuntimeError(
+                "The model has no pricing information (cached; the lookup is skipped until the model or "
+                "provider changes)"
+            )
+        if self.config.cost_tracking != "ignore_errors":
+            msg = (
+                f"Error calculating cost for model {self.config.model_name}: {error}, perhaps it's not registered? "
+                "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
+                "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
+                "Alternatively check the 'Cost tracking' section in the documentation at "
+                "https://klieret.short.gy/mini-local-models. "
+                " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
+            )
+            logger.critical(msg)
+            raise RuntimeError(msg) from error
+        if not cached and not self._missing_cost_warned:
+            self._missing_cost_warned = True
+            logger.warning(
+                "No cost information available for model %s (%s). Calls are recorded without cost and are not "
+                "added to the total. This is cached in %s until the model or provider changes. Configure "
+                "'litellm_model_registry' or use a provider that reports costs to enable cost tracking.",
+                self.config.model_name,
+                error,
+                _UNPRICED_CACHE_PATH,
+            )
+        return {"cost": 0.0, "cost_known": False}
 
     def _parse_actions(self, response) -> list[dict]:
         """Parse tool calls from the response. Raises FormatError if unknown tool."""

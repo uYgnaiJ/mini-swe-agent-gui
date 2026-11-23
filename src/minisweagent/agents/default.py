@@ -16,7 +16,6 @@ from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
-from minisweagent.agents.utils.conversation import conversational_reply
 from minisweagent.exceptions import (
     FormatError,
     InterruptAgentFlow,
@@ -30,6 +29,55 @@ from minisweagent.models.utils.content_string import get_content_string
 from minisweagent.models.utils.token_usage import extract_token_usage
 from minisweagent.utils.images import build_multimodal_content, normalize_images
 from minisweagent.utils.serialize import recursive_merge
+
+_PLAN_PROMPT = """You are the planning stage of a coding agent that has a single bash tool.
+Decide what the latest user request needs BEFORE any tool is used.
+
+Reply with exactly one JSON object, no markdown:
+{
+  "intent": "question" | "exploration" | "small_edit" | "large_edit",
+  "use_tools": true | false,
+  "write_files": true | false,
+  "reply_directly": true | false,
+  "steps": <integer between 1 and {max_steps}>,
+  "plan": "<one sentence describing the next actions>"
+}
+
+Rules:
+- Questions, explanations, or opinions: use_tools=false, write_files=false, reply_directly=true, steps <= 2.
+- Read-only investigation of the repository: use_tools=true, write_files=false, steps 2-6.
+- Code changes: write_files=true; small_edit 4-10 steps, large_edit 10-{max_steps}.
+- Never plan an unbounded run. Prefer the smallest number of steps that can finish the job.
+"""
+
+_CHECKPOINT_PROMPT = """You are the checkpoint stage of a coding agent.
+The agent has used its step budget. Review the work so far and decide what happens next.
+
+Reply with exactly one JSON object, no markdown:
+{
+  "status": "report" | "continue",
+  "summary": "<what was done and what remains, in 2-3 sentences>",
+  "answer": "<final answer for the user when status=report; otherwise empty>",
+  "next_steps": <integer between 1 and {max_steps} when status=continue; otherwise 0>,
+  "plan": "<how to continue when status=continue; otherwise empty>"
+}
+
+Report when the task is complete, blocked, or more exploration would not help.
+Continue only when concrete progress is still possible, and keep next_steps tight.
+"""
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """Return the first JSON object embedded in model output, if any."""
+    value = str(text or "")
+    start, end = value.find("{"), value.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        parsed = json.loads(value[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 class AgentConfig(BaseModel):
@@ -51,8 +99,14 @@ class AgentConfig(BaseModel):
     """Exit after the same action sequence repeats this many times (0 = no limit)."""
     max_empty_submission_retries: int = 1
     """Ask the model for a final answer when it submits an empty result."""
-    conversational_response: str = ""
-    """Override the automatic reply for greetings and other simple chat messages."""
+    auto_budget: bool = False
+    """Classify each request and set a step budget before running (the GUI enables this)."""
+    min_step_budget: int = 3
+    """Smallest step budget the planner may assign."""
+    max_step_budget: int = 25
+    """Largest step budget the planner may assign."""
+    max_budget_extensions: int = 2
+    """How often a checkpoint may extend the budget before the turn has to end."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
 
@@ -68,6 +122,7 @@ class DefaultAgent:
         self.logger = logging.getLogger("agent")
         self.cost = 0.0
         self.n_calls = 0
+        self.n_calls_without_cost = 0
         self.token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self.n_consecutive_format_errors = 0
         self._start_time = time.time()
@@ -76,6 +131,8 @@ class DefaultAgent:
         self._last_action_signature: tuple[str, ...] | None = None
         self._n_repeated_actions = 0
         self._n_empty_submission_retries = 0
+        self._step_budget = 0
+        self._budget_extensions = 0
 
     def set_event_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None:
         """Register a callback for live run events (used by the GUI).
@@ -118,6 +175,135 @@ class DefaultAgent:
             self.token_usage[key] += value
         return usage
 
+    def _conversation_excerpt(self, *, limit: int = 6, chars: int = 500) -> str:
+        """Compact transcript for the planner and checkpoint prompts."""
+        lines = []
+        for message in self.messages[-limit:]:
+            role = str(message.get("role") or "")
+            text = get_content_string(message).strip()
+            if role in ("system", "exit") or not text:
+                continue
+            lines.append(f"{role}: {text[:chars]}")
+        return "\n".join(lines)
+
+    def _query_json(self, system_prompt: str, user_prompt: str) -> dict | None:
+        """Best-effort JSON query used by the planner and checkpoint stages."""
+        try:
+            message = self.model.query(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+            )
+        except Exception:  # noqa: BLE001 - planning must never abort a run
+            return None
+        extra = message.get("extra", {})
+        self.cost += extra.get("cost", 0.0)
+        self._record_token_usage(message)
+        return _extract_json_object(get_content_string(message))
+
+    def _budget_from_plan(self, plan: dict | None) -> int:
+        """Clamp a planner/checkpoint step estimate to the configured bounds."""
+        try:
+            steps = int(plan.get("steps", plan.get("next_steps")))
+        except (AttributeError, TypeError, ValueError):
+            steps = self.config.max_step_budget
+        steps = max(self.config.min_step_budget, min(self.config.max_step_budget, steps))
+        if plan and plan.get("reply_directly"):
+            steps = min(steps, 2)
+        if self.config.step_limit > 0:
+            steps = min(steps, self.config.step_limit)
+        return max(1, steps)
+
+    def _append_system_note(self, note: str) -> None:
+        if not self.messages or self.messages[0].get("role") != "system":
+            return
+        content = self.messages[0].get("content")
+        if not isinstance(content, str):
+            return
+        # Replace the previous turn's note instead of stacking them.
+        content = content.split("\n<work_plan>", 1)[0]
+        self.messages[0]["content"] = content + note
+
+    def _plan_turn(self, task: str) -> None:
+        """Classify the request and set the step budget before the loop starts."""
+        if not self.config.auto_budget:
+            return
+        plan = self._query_json(
+            _PLAN_PROMPT.replace("{max_steps}", str(self.config.max_step_budget)),
+            f"Recent conversation:\n{self._conversation_excerpt() or '(none)'}\n\nLatest user request:\n{task}",
+        )
+        budget = self._budget_from_plan(plan)
+        self._step_budget = budget
+        plan_text = str(plan.get("plan") or "") if plan else ""
+        write_files = bool(plan and plan.get("write_files"))
+        reply_directly = bool(plan and plan.get("reply_directly"))
+        self._emit(
+            {
+                "type": "plan",
+                "intent": str(plan.get("intent") or "") if plan else "",
+                "plan": plan_text,
+                "steps": budget,
+                "write_files": write_files,
+                "reply_directly": reply_directly,
+                "source": "planner" if plan else "fallback",
+            }
+        )
+        notes = [
+            "Internal plan from the planning stage (not a user instruction; the user request takes precedence):",
+            f"- Approach: {plan_text or 'planner unavailable'}",
+            f"- Step budget: about {budget} steps.",
+        ]
+        if reply_directly:
+            notes.append("- Answer directly without calling tools.")
+        elif not write_files:
+            notes.append("- Read-only: do not modify files unless the user explicitly asks for changes.")
+        self._append_system_note("\n<work_plan>\n" + "\n".join(notes) + "\n</work_plan>")
+
+    def _budget_exhausted(self) -> bool:
+        return self.config.auto_budget and 0 < self._step_budget <= self.n_calls
+
+    def _finish_from_checkpoint(self, decision: dict | None) -> None:
+        answer = ""
+        if decision:
+            answer = str(decision.get("answer") or "").strip() or str(decision.get("summary") or "").strip()
+        status = "Submitted" if answer else "LimitsExceeded"
+        raise Submitted(
+            self.model.format_message(
+                role="exit",
+                content=answer or "Stopped after reaching the step budget.",
+                extra={
+                    "exit_status": status,
+                    "submission": answer if status == "Submitted" else "",
+                    "budget_summary": True,
+                },
+            )
+        )
+
+    def _handle_budget_checkpoint(self) -> None:
+        """Summarize the work at the budget boundary and either report or replan."""
+        self._emit({"type": "budget_reached", "step": self.n_calls, "budget": self._step_budget})
+        decision = self._query_json(
+            _CHECKPOINT_PROMPT.replace("{max_steps}", str(self.config.max_step_budget)),
+            f"Task: {self.extra_template_vars.get('task', '')}\n"
+            f"Steps used: {self.n_calls} of {self._step_budget}\n"
+            f"Work so far:\n{self._conversation_excerpt() or '(no messages)'}",
+        )
+        steps = self._budget_from_plan(decision) if decision and decision.get("status") == "continue" else 0
+        if self.config.step_limit > 0:
+            steps = min(steps, self.config.step_limit - self.n_calls)
+        if steps <= 0 or self._budget_extensions >= self.config.max_budget_extensions:
+            self._finish_from_checkpoint(decision)
+        self._budget_extensions += 1
+        self._step_budget = self.n_calls + steps
+        self._emit(
+            {
+                "type": "budget_extended",
+                "step": self.n_calls,
+                "steps": steps,
+                "budget": self._step_budget,
+                "summary": str(decision.get("summary") or ""),
+                "plan": str(decision.get("plan") or ""),
+            }
+        )
+
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
             self.config.model_dump(),
@@ -148,60 +334,13 @@ class DefaultAgent:
             "submission": result.get("submission", ""),
             "cost": self.cost,
             "n_calls": self.n_calls,
+            "calls_without_cost": self.n_calls_without_cost,
             "prompt_tokens": self.token_usage["prompt_tokens"],
             "completion_tokens": self.token_usage["completion_tokens"],
             "total_tokens": self.token_usage["total_tokens"],
             "tokens": self.token_usage["total_tokens"],
             "token_usage": dict(self.token_usage),
         }
-
-    def _complete_conversational_task(self, task: str) -> dict | None:
-        """Answer a greeting/social message without entering the bash loop.
-
-        The normal agent protocol requires a bash tool call on every turn. For
-        messages such as "hi" that is the wrong behaviour: it makes the model
-        inspect/search the repository even though there is no engineering task.
-        Return ``None`` for real tasks so the normal loop runs unchanged.
-        """
-        reply = conversational_reply(task)
-        if reply is None:
-            return None
-        reply = self.config.conversational_response.strip() or reply
-        assistant_message = self.model.format_message(role="assistant", content=reply)
-        self.add_messages(assistant_message)
-        self._emit(
-            {
-                "type": "assistant_message",
-                "content": reply,
-                "actions": [],
-                "cost": 0.0,
-                "step": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "tokens": 0,
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "total_prompt_tokens": 0,
-                "total_completion_tokens": 0,
-                "total_tokens_used": 0,
-                "cumulative_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "conversational": True,
-            }
-        )
-        result = {
-            "exit_status": "Submitted",
-            "submission": reply,
-        }
-        self.add_messages(
-            self.model.format_message(
-                role="exit",
-                content=reply,
-                extra={"exit_status": "Submitted", "submission": reply, "conversational": True},
-            )
-        )
-        self.save(self.config.output_path)
-        self._emit(self._done_event(result))
-        return result
 
     def handle_uncaught_exception(self, e: Exception) -> list[dict]:
         return self.add_messages(
@@ -234,6 +373,8 @@ class DefaultAgent:
         self._last_action_signature = None
         self._n_repeated_actions = 0
         self._n_empty_submission_retries = 0
+        self._step_budget = 0
+        self._budget_extensions = 0
         self.n_consecutive_format_errors = 0
 
     def _emit_run_start(self, task: str, image_urls: list[str]) -> None:
@@ -257,6 +398,8 @@ class DefaultAgent:
             except FormatError as e:
                 # The call was billed before parsing failed, so query() never got to charge it.
                 self.cost += e.messages[0].get("extra", {}).get("cost", 0.0)
+                if e.messages[0].get("extra", {}).get("cost_known", True) is False:
+                    self.n_calls_without_cost += 1
                 usage = self._record_token_usage(e.messages[0])
                 self.n_consecutive_format_errors += 1
                 self._emit(
@@ -264,6 +407,8 @@ class DefaultAgent:
                         "type": "format_error",
                         "message": get_content_string(e.messages[0]) or str(e),
                         "step": self.n_calls,
+                        "cost": e.messages[0].get("extra", {}).get("cost", 0.0),
+                        "cost_known": e.messages[0].get("extra", {}).get("cost_known", True),
                         "consecutive_errors": self.n_consecutive_format_errors,
                         "prompt_tokens": usage["prompt_tokens"],
                         "completion_tokens": usage["completion_tokens"],
@@ -351,10 +496,7 @@ class DefaultAgent:
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=task_content),
         )
-        # Short greetings should not skip over an attached image.
-        conversational_result = self._complete_conversational_task(task) if not image_urls else None
-        if conversational_result is not None:
-            return conversational_result
+        self._plan_turn(task)
         return self._run_until_finished()
 
     def continue_run(
@@ -393,10 +535,7 @@ class DefaultAgent:
             self.model.format_message(role="user", content=build_multimodal_content(follow_up_text, image_urls))
         )
         self._emit_run_start(task, image_urls)
-        # Short greetings should not skip over an attached image.
-        conversational_result = self._complete_conversational_task(task) if not image_urls else None
-        if conversational_result is not None:
-            return conversational_result
+        self._plan_turn(task)
         return self._run_until_finished()
 
     def _should_retry_empty_submission(self, error: Submitted) -> bool:
@@ -415,7 +554,17 @@ class DefaultAgent:
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
         self._raise_if_stop_requested()
-        if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
+        if 0 < self.config.cost_limit <= self.cost:
+            raise LimitsExceeded(
+                {
+                    "role": "exit",
+                    "content": "LimitsExceeded",
+                    "extra": {"exit_status": "LimitsExceeded", "submission": ""},
+                }
+            )
+        if self._budget_exhausted():
+            self._handle_budget_checkpoint()
+        if 0 < self.config.step_limit <= self.n_calls:
             raise LimitsExceeded(
                 {
                     "role": "exit",
@@ -444,6 +593,8 @@ class DefaultAgent:
         else:
             message = self.model.query(self.messages)
         self.cost += message.get("extra", {}).get("cost", 0.0)
+        if message.get("extra", {}).get("cost_known", True) is False:
+            self.n_calls_without_cost += 1
         usage = self._record_token_usage(message)
         self.add_messages(message)
         self._emit(
@@ -452,6 +603,7 @@ class DefaultAgent:
                 "content": get_content_string(message),
                 "actions": message.get("extra", {}).get("actions", []),
                 "cost": message.get("extra", {}).get("cost", 0.0),
+                "cost_known": message.get("extra", {}).get("cost_known", True),
                 "step": self.n_calls,
                 "prompt_tokens": usage["prompt_tokens"],
                 "completion_tokens": usage["completion_tokens"],
